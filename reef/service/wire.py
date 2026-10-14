@@ -17,6 +17,12 @@ from reef.core.records_types import RequestType, parse_references
 
 SCENARIO_HEADER = "x-reef-scenario"
 RELEASE_ID_HEADER = "x-reef-release-id"
+#: Standard idempotency header for inference retries; scoped per scenario.
+IDEMPOTENCY_KEY_HEADER = "idempotency-key"
+#: A client-chosen receipt id on an inference request doubles as an
+#: idempotency key, so an echoed ``x-reef-agent-record-id`` makes a retry
+#: return the same receipt.
+AGENT_RECORD_ID_REQUEST_HEADER = "x-reef-agent-record-id"
 #: Harness-stamped side-channel context (method-integration RFC §3.2). The
 #: service never reads a tag's meaning — it carries the pair through to
 #: the INFERENCE record so a processor can correlate on it. Header-free
@@ -36,6 +42,39 @@ class RequestHeaders:
     release_id: str | None = None
     #: ``x-reef-tag-<name>`` pairs, lowercased names, opaque values.
     tags: Mapping[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class InferenceIdempotency:
+    """The cache key for an inference request, plus the receipt id when pinned."""
+
+    scenario: str
+    key: str
+    agent_record_id: str | None = None
+
+
+def parse_inference_idempotency(headers: Mapping[str, str]) -> InferenceIdempotency | None:
+    """Read ``Idempotency-Key`` / request ``x-reef-agent-record-id``.
+
+    Both name the same deduplication key within the scenario. The receipt
+    header additionally pins the stored record's id so the first response and
+    every replay return the identical ``agent_record_id``. When both are sent
+    with different values the request is rejected.
+    """
+    normalized = {key.lower(): value.strip() for key, value in headers.items()}
+    idempotency_key = normalized.get(IDEMPOTENCY_KEY_HEADER) or None
+    agent_record_id = normalized.get(AGENT_RECORD_ID_REQUEST_HEADER) or None
+    if idempotency_key is not None and agent_record_id is not None and idempotency_key != agent_record_id:
+        raise HeaderError(
+            f"{IDEMPOTENCY_KEY_HEADER} and {AGENT_RECORD_ID_REQUEST_HEADER} must agree when both are sent"
+        )
+    key = idempotency_key or agent_record_id
+    if key is None:
+        return None
+    scenario = normalized.get(SCENARIO_HEADER, "").strip()
+    if not scenario:
+        raise HeaderError(f"missing or empty {SCENARIO_HEADER}")
+    return InferenceIdempotency(scenario=scenario, key=key, agent_record_id=agent_record_id)
 
 
 def parse_request_headers(headers: Mapping[str, str], request_type: RequestType) -> RequestHeaders:

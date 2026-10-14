@@ -11,12 +11,14 @@ from reef.runtime.interfaces import InferenceHandler
 from reef.service.auth import create_authentication_middleware
 from reef.service.cors import configure_browser_access
 from reef.service.errors import translate_errors
+from reef.service.idempotency import IdempotencySettings
 from reef.service.request_service import InferenceRetryPolicy, RequestService
 from reef.service.routes import register_routes
 from reef.storage.records import RecordRetention
 
 logger = logging.getLogger(__name__)
 _RECORD_RETENTION_INTERVAL_SECONDS = 60.0
+_INFERENCE_CACHE_SWEEP_INTERVAL_SECONDS = 60.0
 
 
 async def _maintain_records(dispatcher: Dispatcher, retention: RecordRetention, stopped: asyncio.Event) -> None:
@@ -40,11 +42,16 @@ def create_app(
     console_origins: Iterable[str] = (),
     inference_handler: InferenceHandler | None = None,
     inference_retry_policy: InferenceRetryPolicy | None = None,
+    inference_idempotency: IdempotencySettings | None = None,
     close_dispatcher: bool = False,
     record_retention: RecordRetention | None = None,
 ) -> web.Application:
     """Build the HTTP app around an existing dispatcher; close it only when requested."""
-    request_service = RequestService(dispatcher, retry_policy=inference_retry_policy)
+    request_service = RequestService(
+        dispatcher,
+        retry_policy=inference_retry_policy,
+        idempotency=inference_idempotency,
+    )
     request_service_key = web.AppKey("reef_request_service", RequestService)
     app = web.Application(middlewares=[create_authentication_middleware(tokens), translate_errors])
     configure_browser_access(app, console_origins)
@@ -67,6 +74,30 @@ def create_app(
                 await task
 
         app.cleanup_ctx.append(maintain_records)
+
+    if inference_idempotency is not None and inference_idempotency.enabled:
+
+        async def sweep_inference_cache(app: web.Application):
+            stopped = asyncio.Event()
+
+            async def sweep() -> None:
+                while not stopped.is_set():
+                    request_service.inference_cache.purge_expired()
+                    try:
+                        await asyncio.wait_for(
+                            stopped.wait(), timeout=_INFERENCE_CACHE_SWEEP_INTERVAL_SECONDS
+                        )
+                    except TimeoutError:
+                        continue
+
+            task = asyncio.create_task(sweep())
+            try:
+                yield
+            finally:
+                stopped.set()
+                await task
+
+        app.cleanup_ctx.append(sweep_inference_cache)
     if close_dispatcher:
 
         async def cleanup(app: web.Application) -> None:
@@ -77,6 +108,7 @@ def create_app(
 
 
 __all__ = [
+    "IdempotencySettings",
     "InferenceRetryPolicy",
     "RequestService",
     "create_app",

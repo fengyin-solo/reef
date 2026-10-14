@@ -30,10 +30,28 @@ from reef.observability.operations import OperationMeasurement, OperationMetrics
 from reef.recipe.errors import RecipeConfigError
 from reef.runtime.interfaces import InferenceAdmissionHandle, InferenceHandler, InferenceStream
 from reef.scenario.scenario import Scenario
+from reef.service.idempotency import (
+    CachedInference,
+    IdempotencyConflict,
+    IdempotencySettings,
+    InferenceCacheClaim,
+    InferenceFlight,
+    InferenceLeaderExecutionFailed,
+    InferenceResponseCache,
+    canonical_request_fingerprint,
+)
 from reef.service.install_script import TOKEN_PLACEHOLDER, render_install_script
 from reef.service.release_page import before_release_id, build_release_page, result_of
 from reef.service.request_page import STATE_WORDS, build_request_page, request_state, settled_step
-from reef.service.wire import SCENARIO_HEADER, ProposalPayload, ReportPayload, RequestHeaders, parse_request_headers
+from reef.service.wire import (
+    SCENARIO_HEADER,
+    InferenceIdempotency,
+    ProposalPayload,
+    ReportPayload,
+    RequestHeaders,
+    parse_inference_idempotency,
+    parse_request_headers,
+)
 from reef.surface.base import InferenceLease, LeasingInferenceHooks, Surface
 from reef.surface.weights import RuntimeLoadMismatch, reported_runtime_load_id, reported_runtime_load_spans
 from reef.train.cordis_backend.contracts import ProposalValidator, StepProgressReader, StepRecords
@@ -147,13 +165,134 @@ class InferenceRetryTimeout(ReefError):
 
 
 class RequestService:
-    def __init__(self, dispatcher: Dispatcher, *, retry_policy: InferenceRetryPolicy | None = None) -> None:
+    def __init__(
+        self,
+        dispatcher: Dispatcher,
+        *,
+        retry_policy: InferenceRetryPolicy | None = None,
+        idempotency: IdempotencySettings | None = None,
+    ) -> None:
         self._dispatcher = dispatcher
         self._retry_policy = retry_policy or InferenceRetryPolicy()
+        self._inference_cache = InferenceResponseCache(idempotency or IdempotencySettings())
 
     @property
     def dispatcher(self) -> Dispatcher:
         return self._dispatcher
+
+    @property
+    def inference_cache(self) -> InferenceResponseCache:
+        return self._inference_cache
+
+    def inference_idempotency(self, headers: Mapping[str, str]) -> InferenceIdempotency | None:
+        """The request's idempotency key, or None when the feature or header is absent."""
+        if not self._inference_cache.enabled:
+            return None
+        return parse_inference_idempotency(headers)
+
+    def claim_inference(
+        self,
+        idempotency_key: InferenceIdempotency,
+        path: str,
+        payload: Mapping[str, Any],
+    ) -> InferenceCacheClaim:
+        """Join, wait for, or lead the single execution of one idempotent request."""
+        fingerprint = canonical_request_fingerprint(path, payload)
+        return self._inference_cache.claim(idempotency_key.scenario, idempotency_key.key, fingerprint)
+
+    async def await_inference_flight(self, claim: InferenceCacheClaim) -> CachedInference:
+        """Wait for an in-flight leader; a leader failure lets the caller retry as leader itself."""
+        flight = claim.flight
+        if flight is None:
+            raise ValueError("inference cache claim carries no in-flight request")
+        try:
+            # Shielding: a waiter that gives up (timeout/client disconnect) must
+            # not cancel the shared leader future.
+            return await asyncio.shield(flight.future)
+        except IdempotencyConflict:
+            raise
+        except Exception as exc:
+            raise InferenceLeaderExecutionFailed("the in-flight inference request failed") from exc
+
+    def same_inference_request(
+        self,
+        entry: CachedInference,
+        path: str,
+        payload: Mapping[str, Any],
+    ) -> bool:
+        return entry.request_fingerprint == canonical_request_fingerprint(path, payload)
+
+    async def assert_cached_boundary(self, entry: CachedInference, headers: Mapping[str, str]) -> None:
+        """Reject a replay when the scenario's serving release moved since the first response."""
+        parsed = parse_request_headers(headers, RequestType.INFERENCE)
+        scenario = await asyncio.to_thread(
+            self._dispatcher.get_or_create_scenario,
+            parsed.scenario,
+            release_id=parsed.release_id,
+        )
+        if scenario is None:
+            raise UnknownScenario(f"unknown scenario {parsed.scenario!r}")
+        current_release = scenario.current_artifact_ref().release_id
+        if current_release != entry.release_id:
+            raise IdempotencyConflict(
+                f"idempotency key was already served at release {entry.release_id!r}; "
+                f"the scenario now serves {current_release!r}"
+            )
+
+    def complete_buffered_inference(
+        self,
+        idempotency_key: InferenceIdempotency,
+        flight: InferenceFlight,
+        item: AgentRecord,
+        path: str,
+        payload: Mapping[str, Any],
+        response_payload: Mapping[str, Any],
+    ) -> None:
+        if item.artifact_ref is None:
+            raise ValueError("a completed inference record must name the artifact release it ran on")
+        self._inference_cache.complete_buffered(
+            idempotency_key.scenario,
+            idempotency_key.key,
+            flight,
+            agent_record_id=item.agent_record_id,
+            release_id=item.artifact_ref.release_id,
+            request_fingerprint=canonical_request_fingerprint(path, payload),
+            response_payload=response_payload,
+        )
+
+    def complete_streamed_inference(
+        self,
+        idempotency_key: InferenceIdempotency,
+        flight: InferenceFlight,
+        item: AgentRecord,
+        path: str,
+        payload: Mapping[str, Any],
+        *,
+        status: int,
+        headers: Mapping[str, str],
+        body: bytes,
+    ) -> None:
+        if item.artifact_ref is None:
+            raise ValueError("a completed inference record must name the artifact release it ran on")
+        self._inference_cache.complete_streamed(
+            idempotency_key.scenario,
+            idempotency_key.key,
+            flight,
+            agent_record_id=item.agent_record_id,
+            release_id=item.artifact_ref.release_id,
+            request_fingerprint=canonical_request_fingerprint(path, payload),
+            status=status,
+            headers=headers,
+            body=body,
+        )
+
+    def fail_inference(
+        self,
+        idempotency_key: InferenceIdempotency,
+        flight: InferenceFlight,
+        error: Exception,
+    ) -> None:
+        self._inference_cache.fail(idempotency_key.scenario, idempotency_key.key, flight, error)
 
     def accept(
         self,
@@ -184,6 +323,8 @@ class RequestService:
         payload: dict[str, Any],
         path: str,
         handler: InferenceHandler | None = None,
+        *,
+        agent_record_id: str | None = None,
     ) -> tuple[dict[str, Any], AgentRecord]:
         operations = await self.inference_operations(headers)
         measurement = operations.start("serve/request")
@@ -233,6 +374,7 @@ class RequestService:
                             prepared.parsed,
                             {**payload, "response": response},
                             artifact_ref=prepared.artifact.ref,
+                            agent_record_id=agent_record_id,
                         )
                         succeeded = True
                         return client_inference_response(response), item
@@ -269,6 +411,8 @@ class RequestService:
         payload: dict[str, Any],
         path: str,
         handler: InferenceHandler | None = None,
+        *,
+        agent_record_id: str | None = None,
     ) -> tuple[InferenceStream, PendingInference]:
         operations = await self.inference_operations(headers)
         measurement = operations.start("serve/request")
@@ -314,6 +458,7 @@ class RequestService:
                     scenario=prepared.parsed.scenario,
                     request_type=RequestType.INFERENCE,
                     payload=_with_tags(payload, prepared.parsed),
+                    agent_record_id=agent_record_id,
                     artifact_ref=prepared.artifact.ref,
                 ),
                 release_id=prepared.parsed.release_id,

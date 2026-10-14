@@ -8,6 +8,17 @@ from typing import Any
 from aiohttp import web
 
 from reef.runtime.interfaces import MULTIMODAL_ROUTES, InferenceHandler
+from reef.service.idempotency import (
+    CLAIM_CACHED,
+    CLAIM_WAITING,
+    CachedBufferedInference,
+    CachedStreamedInference,
+    IdempotencyConflict,
+    IdempotencyInProgress,
+    InferenceCacheClaim,
+    InferenceFlight,
+    InferenceLeaderExecutionFailed,
+)
 from reef.service.request_service import RequestService
 from reef.service.routes.payload import read_object
 from reef.service.streaming import (
@@ -17,7 +28,7 @@ from reef.service.streaming import (
     receipt_sse_events,
     stream_record,
 )
-from reef.service.wire import RELEASE_ID_HEADER
+from reef.service.wire import RELEASE_ID_HEADER, InferenceIdempotency
 
 logger = logging.getLogger(__name__)
 
@@ -33,12 +44,14 @@ class _SSERelay:
 
     The terminal event is withheld so Reef can append its receipt frames before
     it, and the chat-completion identity those frames need is picked up from the
-    first frame that carries one.
+    first frame that carries one. Every byte passed to the client is also
+    appended to ``sent`` so a completed stream can be replayed from cache.
     """
 
-    def __init__(self, path: str, response: web.StreamResponse) -> None:
+    def __init__(self, path: str, response: web.StreamResponse, sent: bytearray) -> None:
         self._path = path
         self._response = response
+        self._sent = sent
         self._decoder = SSEFrameDecoder()
         self.chat_identity: dict[str, Any] = {}
         self.terminal: bytes | None = None
@@ -58,6 +71,7 @@ class _SSERelay:
             return True
         if remainder:
             await self._response.write(remainder)
+            self._sent.extend(remainder)
         return False
 
     async def _write(self, frames: Iterable[bytes]) -> bool:
@@ -68,7 +82,97 @@ class _SSERelay:
             if not self.chat_identity:
                 self.chat_identity = chat_completion_chunk_identity(frame)
             await self._response.write(frame)
+            self._sent.extend(frame)
         return False
+
+
+async def _buffered_replay(
+    request_service: RequestService,
+    headers: Mapping[str, str],
+    entry: CachedBufferedInference,
+) -> web.Response:
+    response_headers = {"x-reef-agent-record-id": entry.agent_record_id}
+    response_headers.update(await _release_header(request_service, headers))
+    return web.json_response(dict(entry.response_payload), headers=response_headers)
+
+
+def _streamed_replay(entry: CachedStreamedInference) -> web.Response:
+    return web.Response(body=entry.body, status=entry.status, headers=dict(entry.headers))
+
+
+async def _await_idempotent_flight(
+    request_service: RequestService,
+    claim: InferenceCacheClaim,
+) -> CachedBufferedInference | CachedStreamedInference:
+    try:
+        return await asyncio.wait_for(
+            request_service.await_inference_flight(claim),
+            timeout=request_service.inference_cache.wait_timeout_seconds,
+        )
+    except TimeoutError as exc:
+        raise IdempotencyInProgress(
+            "a matching inference request is still being processed; retry later"
+        ) from exc
+
+
+async def _idempotent_buffered(
+    request: web.Request,
+    payload: dict[str, Any],
+    *,
+    request_service: RequestService,
+    inference_handler: InferenceHandler | None,
+    idempotency_key: InferenceIdempotency,
+) -> web.Response:
+    while True:
+        claim = request_service.claim_inference(idempotency_key, request.path, payload)
+        if claim.kind == CLAIM_CACHED and claim.entry is not None:
+            if not isinstance(claim.entry, CachedBufferedInference):
+                raise IdempotencyConflict("idempotency key was already used for a streaming request")
+            await request_service.assert_cached_boundary(claim.entry, request.headers)
+            return await _buffered_replay(request_service, request.headers, claim.entry)
+        if claim.kind == CLAIM_WAITING:
+            try:
+                entry = await _await_idempotent_flight(request_service, claim)
+            except InferenceLeaderExecutionFailed:
+                continue
+            if not request_service.same_inference_request(entry, request.path, payload):
+                raise IdempotencyConflict(
+                    "idempotency key was already used with a different request payload or path"
+                )
+            if not isinstance(entry, CachedBufferedInference):
+                raise IdempotencyConflict("idempotency key was already used for a streaming request")
+            await request_service.assert_cached_boundary(entry, request.headers)
+            return await _buffered_replay(request_service, request.headers, entry)
+
+        flight = claim.flight
+        if flight is None:
+            raise RuntimeError("idempotency leader claim carries no flight")
+        try:
+            response_payload, item = await request_service.infer_with_data(
+                request.headers,
+                payload,
+                request.path,
+                inference_handler,
+                agent_record_id=idempotency_key.agent_record_id,
+            )
+        except BaseException as exc:
+            request_service.fail_inference(
+                idempotency_key,
+                flight,
+                exc if isinstance(exc, Exception) else RuntimeError("inference request was cancelled"),
+            )
+            raise
+        request_service.complete_buffered_inference(
+            idempotency_key,
+            flight,
+            item,
+            request.path,
+            payload,
+            response_payload,
+        )
+        headers = {"x-reef-agent-record-id": item.agent_record_id}
+        headers.update(await _release_header(request_service, request.headers))
+        return web.json_response(response_payload, headers=headers)
 
 
 async def _relay_inference_stream(
@@ -77,14 +181,80 @@ async def _relay_inference_stream(
     *,
     request_service: RequestService,
     inference_handler: InferenceHandler | None,
+    idempotency_key: InferenceIdempotency | None,
 ) -> web.StreamResponse:
-    """Stream one upstream inference to the client and record what it sent."""
-    upstream, pending = await request_service.start_stream(
-        request.headers,
+    """Stream one upstream inference to the client and record what it sent.
+
+    With an idempotency key, a completed response is cached and replays never
+    invoke the handler or append another record; only the leader executes.
+    """
+    if idempotency_key is not None:
+        while True:
+            claim = request_service.claim_inference(idempotency_key, request.path, payload)
+            if claim.kind == CLAIM_CACHED and claim.entry is not None:
+                if not isinstance(claim.entry, CachedStreamedInference):
+                    raise IdempotencyConflict("idempotency key was already used for a non-streaming request")
+                await request_service.assert_cached_boundary(claim.entry, request.headers)
+                return _streamed_replay(claim.entry)
+            if claim.kind == CLAIM_WAITING:
+                try:
+                    entry = await _await_idempotent_flight(request_service, claim)
+                except InferenceLeaderExecutionFailed:
+                    continue
+                if not request_service.same_inference_request(entry, request.path, payload):
+                    raise IdempotencyConflict(
+                        "idempotency key was already used with a different request payload or path"
+                    )
+                if not isinstance(entry, CachedStreamedInference):
+                    raise IdempotencyConflict("idempotency key was already used for a non-streaming request")
+                await request_service.assert_cached_boundary(entry, request.headers)
+                return _streamed_replay(entry)
+            return await _stream_leader(
+                request,
+                payload,
+                request_service=request_service,
+                inference_handler=inference_handler,
+                idempotency_key=idempotency_key,
+                flight=claim.flight,
+            )
+    return await _stream_leader(
+        request,
         payload,
-        request.path,
-        inference_handler,
+        request_service=request_service,
+        inference_handler=inference_handler,
+        idempotency_key=None,
+        flight=None,
     )
+
+
+async def _stream_leader(
+    request: web.Request,
+    payload: dict[str, Any],
+    *,
+    request_service: RequestService,
+    inference_handler: InferenceHandler | None,
+    idempotency_key: InferenceIdempotency | None,
+    flight: InferenceFlight | None,
+) -> web.StreamResponse:
+    """Execute one (possibly first-and-only) streaming inference and relay it."""
+    cache_completed = False
+
+    def fail_waiters(reason: Exception) -> None:
+        nonlocal cache_completed
+        if idempotency_key is not None and flight is not None and not cache_completed:
+            request_service.fail_inference(idempotency_key, flight, reason)
+
+    try:
+        upstream, pending = await request_service.start_stream(
+            request.headers,
+            payload,
+            request.path,
+            inference_handler,
+            agent_record_id=None if idempotency_key is None else idempotency_key.agent_record_id,
+        )
+    except BaseException as exc:
+        fail_waiters(exc if isinstance(exc, Exception) else RuntimeError("inference request was cancelled"))
+        raise
     response_headers = {
         name: value
         for name, value in upstream.headers.items()
@@ -100,13 +270,14 @@ async def _relay_inference_stream(
         response_headers["x-reef-agent-record-id"] = pending.item.agent_record_id
     response = web.StreamResponse(status=upstream.status, headers=response_headers)
     body = bytearray()
+    client_body = bytearray()
     complete = False
     error = None
     record_attempted = False
     try:
         await response.prepare(request)
         if is_sse:
-            relay = _SSERelay(request.path, response)
+            relay = _SSERelay(request.path, response, client_body)
             async for chunk in upstream.chunks:
                 body.extend(chunk)
                 if await relay.feed(chunk):
@@ -128,16 +299,31 @@ async def _relay_inference_stream(
                     item.agent_record_id,
                 ):
                     await response.write(frame)
+                    client_body.extend(frame)
+                if idempotency_key is not None and flight is not None:
+                    request_service.complete_streamed_inference(
+                        idempotency_key,
+                        flight,
+                        item,
+                        request.path,
+                        payload,
+                        status=upstream.status,
+                        headers=response_headers,
+                        body=bytes(client_body),
+                    )
+                    cache_completed = True
                 complete = True
         else:
             async for chunk in upstream.chunks:
                 body.extend(chunk)
                 await response.write(chunk)
+                client_body.extend(chunk)
             complete = True
     except ConnectionResetError:
         error = "client disconnected"
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
+        fail_waiters(exc)
         raise
     finally:
         if error is not None:
@@ -150,10 +336,45 @@ async def _relay_inference_stream(
         try:
             await upstream.close()
         finally:
+            stored = None
             if not record_attempted:
-                request_service.record_stream(
-                    pending,
-                    stream_record(upstream, bytes(body), complete=complete, error=error),
+                try:
+                    stored = request_service.record_stream(
+                        pending,
+                        stream_record(upstream, bytes(body), complete=complete, error=error),
+                    )
+                except BaseException as exc:
+                    if idempotency_key is not None and flight is not None:
+                        request_service.fail_inference(
+                            idempotency_key,
+                            flight,
+                            exc if isinstance(exc, Exception) else RuntimeError("inference stream was cancelled"),
+                        )
+                    raise
+            if (
+                idempotency_key is not None
+                and flight is not None
+                and not cache_completed
+                and stored is not None
+                and complete
+                and error is None
+            ):
+                request_service.complete_streamed_inference(
+                    idempotency_key,
+                    flight,
+                    stored,
+                    request.path,
+                    payload,
+                    status=upstream.status,
+                    headers=response_headers,
+                    body=bytes(client_body),
+                )
+                cache_completed = True
+            if not cache_completed and idempotency_key is not None and flight is not None:
+                request_service.fail_inference(
+                    idempotency_key,
+                    flight,
+                    RuntimeError(error or "inference stream did not complete"),
                 )
     return response
 
@@ -166,22 +387,32 @@ def register_inference_routes(
 ) -> None:
     async def inference(request: web.Request) -> web.StreamResponse:
         payload = await read_object(request)
+        idempotency_key = request_service.inference_idempotency(request.headers)
         if payload.get("stream") is True:
             return await _relay_inference_stream(
                 request,
                 payload,
                 request_service=request_service,
                 inference_handler=inference_handler,
+                idempotency_key=idempotency_key,
             )
-        response_payload, item = await request_service.infer_with_data(
-            request.headers,
+        if idempotency_key is None:
+            response_payload, item = await request_service.infer_with_data(
+                request.headers,
+                payload,
+                request.path,
+                inference_handler,
+            )
+            headers = {"x-reef-agent-record-id": item.agent_record_id}
+            headers.update(await _release_header(request_service, request.headers))
+            return web.json_response(response_payload, headers=headers)
+        return await _idempotent_buffered(
+            request,
             payload,
-            request.path,
-            inference_handler,
+            request_service=request_service,
+            inference_handler=inference_handler,
+            idempotency_key=idempotency_key,
         )
-        headers = {"x-reef-agent-record-id": item.agent_record_id}
-        headers.update(await _release_header(request_service, request.headers))
-        return web.json_response(response_payload, headers=headers)
 
     async def multimodal(request: web.Request) -> web.StreamResponse:
         """Relay a multimodal call through the scenario's recipe; the answer streams back unchanged, unrecorded."""

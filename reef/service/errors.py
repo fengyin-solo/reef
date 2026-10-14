@@ -16,6 +16,7 @@ from reef.artifact.artifact import ArtifactConflict, ArtifactError, ArtifactNotF
 from reef.artifact.release_chain import ReleaseNotRestorable
 from reef.core.errors import ReefError, UnknownScenario
 from reef.runtime.interfaces import UpstreamStatusError
+from reef.service.idempotency import IdempotencyConflict, IdempotencyInProgress
 from reef.service.request_service import InferenceRetryTimeout
 from reef.storage.records import RecordConflict
 from reef.surface.weights import RuntimeLoadMismatch
@@ -30,6 +31,8 @@ ERROR_STATUS_TABLE: tuple[tuple[type[Exception], type[web.HTTPError]], ...] = (
     (ReleaseNotRestorable, web.HTTPConflict),
     (RecordConflict, web.HTTPConflict),
     (RuntimeLoadMismatch, web.HTTPConflict),
+    (IdempotencyConflict, web.HTTPConflict),
+    (IdempotencyInProgress, web.HTTPConflict),
     (InferenceRetryTimeout, web.HTTPServiceUnavailable),
     (ArtifactError, web.HTTPServiceUnavailable),
     (ReefError, web.HTTPBadRequest),

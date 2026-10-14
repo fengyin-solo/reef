@@ -75,7 +75,9 @@ def register_scenario_routes(app: web.Application, *, request_service: RequestSe
         return web.json_response(result)
 
     async def delete_scenario(request: web.Request) -> web.Response:
-        result = await asyncio.to_thread(request_service.dispatcher.delete_scenario, request.match_info["scenario"])
+        name = request.match_info["scenario"]
+        result = await asyncio.to_thread(request_service.dispatcher.delete_scenario, name)
+        request_service.inference_cache.clear_scenario(name)
         return web.json_response(result)
 
     async def list_releases(request: web.Request) -> web.Response:

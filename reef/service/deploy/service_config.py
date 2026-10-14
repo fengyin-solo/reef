@@ -133,6 +133,21 @@ class ServiceConfig:
         public_path=("inference", "retry_timeout_s"),
         help="Retry deadline in seconds; defaults to the inference timeout.",
     )
+    inference_idempotency_enabled: bool = config_option(
+        True,
+        public_path=("inference", "idempotency_enabled"),
+        help="Deduplicate retried inference requests carrying Idempotency-Key.",
+    )
+    inference_idempotency_ttl_s: float = config_option(
+        3600.0,
+        public_path=("inference", "idempotency_ttl_s"),
+        help="Completed inference responses stay replayable for this many seconds.",
+    )
+    inference_idempotency_capacity: int = config_option(
+        10_000,
+        public_path=("inference", "idempotency_capacity"),
+        help="Maximum cached completed inference responses; oldest entries are evicted first.",
+    )
     artifact_repository: str = config_option(
         ".reef/artifacts.git", public_path=("storage", "artifact_repository"), help="Artifact repository location."
     )

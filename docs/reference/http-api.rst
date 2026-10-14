@@ -381,6 +381,30 @@ The receipt identifies the stored record:
 
 Streams carry it only after the record is stored.
 
+Idempotent retries
+~~~~~~~~~~~~~~~~~~
+
+An inference request may carry an ``Idempotency-Key`` header (or echo the
+receipt back as a request ``x-reef-agent-record-id`` header). Reef then
+executes the provider call at most once per key within the scenario:
+
+* a replay after the first response returns the same body and the same
+  receipt straight from a completed-response cache — the provider handler is
+  not called again and no second record is stored, so the exchange is not
+  trained on twice;
+* a concurrent duplicate waits for the first request to finish (or gets
+  ``409`` while it is still running) instead of executing twice;
+* reusing a key with a different request body/path, or after the scenario's
+  served artifact release moved, returns ``409``;
+* failed or incomplete responses (including streams that end before their
+  terminal event) are not cached, so the retry runs normally.
+
+The cache is time- and capacity-bound and is cleared when the scenario is
+deleted. Echoing ``x-reef-agent-record-id`` also pins the stored receipt id,
+so the first response and every replay return that exact id. When neither
+header is sent (or the feature is disabled) inference behaves exactly as
+before.
+
 On a scenario that serves harness files, every inference response also
 carries ``x-reef-release-id``: the release ``GET /reef/harness`` serves when
 the response is written, so a head that moves during the call shows on the
