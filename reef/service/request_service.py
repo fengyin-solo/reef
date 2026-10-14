@@ -431,11 +431,12 @@ class RequestService:
         )
         if initial is None:
             raise UnknownScenario(f"unknown scenario {parsed.scenario!r}")
+        admission: InferenceAdmissionHandle | None = None
         if initial.runtime is not None:
             with initial.operations.measure("serve/admission"):
+                # A client that disconnects while queued cancels this await
+                # before any handle exists; the controller removes the waiter.
                 admission = await initial.runtime.acquire_inference()
-        else:
-            admission = None
         try:
             # Re-resolve after admission: a queued request must freeze the head
             # committed by the weight update that released it, never the head it

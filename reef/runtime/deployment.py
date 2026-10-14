@@ -620,6 +620,13 @@ class RuntimeConnectionConfig:
     inference_timeout_s: float = config_option(300.0, help="Inference request timeout in seconds.")
     train_timeout_s: float | None = config_option(None, help="Training request timeout; omitted follows inference.")
     max_staleness: int = config_option(0, help="Maximum admitted training-version lag.")
+    max_active: int | None = config_option(None, help="Maximum concurrent inference requests; omitted is unbounded.")
+    max_waiting: int | None = config_option(
+        None, help="Maximum requests that may wait for an inference slot; omitted is unbounded."
+    )
+    retry_after_s: float = config_option(
+        1.0, help="Suggested Retry-After in seconds returned when inference is overloaded."
+    )
     inference_handler_config: Mapping[str, Any] = field(
         default_factory=dict, metadata=config_metadata("Inference adapter-owned options.")
     )
@@ -633,6 +640,12 @@ class RuntimeConnectionConfig:
                 raise ValueError(f"runtime.{name} must be a positive finite number")
         if isinstance(self.max_staleness, bool) or self.max_staleness < 0:
             raise ValueError("runtime.max_staleness must be a non-negative integer")
+        if self.max_active is not None and (isinstance(self.max_active, bool) or self.max_active < 1):
+            raise ValueError("runtime.max_active must be a positive integer")
+        if self.max_waiting is not None and (isinstance(self.max_waiting, bool) or self.max_waiting < 0):
+            raise ValueError("runtime.max_waiting must be a non-negative integer")
+        if isinstance(self.retry_after_s, bool) or not math.isfinite(self.retry_after_s) or self.retry_after_s <= 0:
+            raise ValueError("runtime.retry_after_s must be a positive finite number")
 
 
 @dataclass(frozen=True)

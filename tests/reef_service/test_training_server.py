@@ -279,6 +279,9 @@ def test_build_dispatcher_connects_runtime_and_injects_selected_recipe(monkeypat
         "model_path": "/models/demo",
         "inference_timeout_s": 30.0,
         "train_timeout_s": None,
+        "max_active": None,
+        "max_waiting": None,
+        "retry_after_s": 1.0,
     }
     assert backend["repository"] == Path("/state/artifacts.git")
 

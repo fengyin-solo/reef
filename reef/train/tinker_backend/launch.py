@@ -145,6 +145,9 @@ class TinkerDeployment(InProcessTrainingDeployment):
             "ray_address": ray_address,
             "inference_timeout_s": settings["inference_timeout_s"],
             "train_timeout_s": settings["train_timeout_s"],
+            "max_active": settings["inference_max_concurrency"],
+            "max_waiting": settings["inference_queue_limit"],
+            "retry_after_s": settings["inference_overload_retry_after_s"],
         }
         if max_staleness:
             runtime_config["max_staleness"] = max_staleness
@@ -191,6 +194,9 @@ class TinkerRuntimeFactory(RuntimeFactory):
                     "api_key_env": settings.api_key_env,
                     "project_id": settings.project_id,
                     "timeout_s": settings.inference_timeout_s,
+                    "max_active": settings.max_active,
+                    "max_waiting": settings.max_waiting,
+                    "retry_after_s": settings.retry_after_s,
                 },
                 model_path=model_path,
                 recipe_config=recipe_config,

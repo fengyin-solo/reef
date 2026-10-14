@@ -26,6 +26,9 @@ class SGLangInferenceRuntime(ExecutorInferenceRuntime):
         model_path: str,
         inference_url: str | None = None,
         inference_timeout_s: float = 300.0,
+        max_active: int | None = None,
+        max_waiting: int | None = None,
+        retry_after_s: float = 1.0,
         inference_handler_factory: type[InferenceHandler] = SGLangInferenceHandler,
         inference_handler_config: Mapping[str, Any] | None = None,
     ) -> None:
@@ -34,6 +37,9 @@ class SGLangInferenceRuntime(ExecutorInferenceRuntime):
             model_path=model_path,
             inference_url=inference_url,
             inference_timeout_s=inference_timeout_s,
+            max_active=max_active,
+            max_waiting=max_waiting,
+            retry_after_s=retry_after_s,
             inference_handler_factory=inference_handler_factory,
             inference_handler_config=inference_handler_config,
         )
@@ -67,6 +73,9 @@ class SGLangRuntimeFactory(RuntimeFactory):
             model_path=model_path,
             inference_url=config.get("inference_url"),
             inference_timeout_s=config.get("inference_timeout_s", 300.0),
+            max_active=config.get("max_active"),
+            max_waiting=config.get("max_waiting"),
+            retry_after_s=config.get("retry_after_s", 1.0),
             inference_handler_factory=config.get("inference_handler_factory", SGLangInferenceHandler),
             inference_handler_config=config.get("inference_handler_config"),
         )

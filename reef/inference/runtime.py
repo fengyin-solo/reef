@@ -32,6 +32,9 @@ class ExecutorInferenceRuntime(InferenceRuntime):
         inference_url: str | None = None,
         model_path: str = "",
         inference_timeout_s: float = 300.0,
+        max_active: int | None = None,
+        max_waiting: int | None = None,
+        retry_after_s: float = 1.0,
         inference_handler_factory: type[InferenceHandler] | None = None,
         inference_handler_config: Mapping[str, Any] | None = None,
     ) -> None:
@@ -53,7 +56,13 @@ class ExecutorInferenceRuntime(InferenceRuntime):
         )
         if not isinstance(handler, InferenceHandler):
             raise TypeError("InferenceHandler.from_config must return an InferenceHandler")
-        super().__init__(base_url=inference_url, inference_timeout_s=inference_timeout_s)
+        super().__init__(
+            base_url=inference_url,
+            inference_timeout_s=inference_timeout_s,
+            max_active=max_active,
+            max_waiting=max_waiting,
+            retry_after_s=retry_after_s,
+        )
         self._handler = handler
         self._model_path = model_path
         # Only the coordinator can reconcile pending publication with Reef's
@@ -82,20 +91,21 @@ class ExecutorInferenceRuntime(InferenceRuntime):
         if not self._control.reconnects:
             return await super().acquire_inference()
         # Admission stays owned by training/commit reconciliation. A request
-        # may verify or wait for serving, but must never reopen a gate that a
-        # concurrent publication closed after this health snapshot was read.
+        # may verify serving, but must never reopen a gate that a concurrent
+        # publication closed after this health snapshot was read. The health
+        # gate is polled before entering the admission queue; once queued, the
+        # request waits its FIFO turn without leaving and re-entering at the
+        # tail, which would break bounded-queue fairness and overload accounting.
         deadline = asyncio.get_running_loop().time() + self.inference_timeout_s
         while True:
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
                 raise TrainingRuntimeError("inference is unavailable during model recovery")
             status = await asyncio.wait_for(asyncio.to_thread(self._publication_status), timeout=remaining)
-            if _serving_available(status):
-                try:
-                    return await asyncio.wait_for(super().acquire_inference(), timeout=min(0.25, remaining))
-                except TimeoutError:
-                    continue
-            await asyncio.sleep(min(0.25, remaining))
+            if not _serving_available(status):
+                await asyncio.sleep(min(0.25, remaining))
+                continue
+            return await super().acquire_inference()
 
     def serving_adapter_name(self) -> str | None:
         return self._publication_status().get("lora_adapter")

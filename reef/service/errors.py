@@ -9,13 +9,14 @@ specific first because several entries are subclasses of later ones
 from __future__ import annotations
 
 import logging
+import math
 
 from aiohttp import web
 
 from reef.artifact.artifact import ArtifactConflict, ArtifactError, ArtifactNotFound
 from reef.artifact.release_chain import ReleaseNotRestorable
 from reef.core.errors import ReefError, UnknownScenario
-from reef.runtime.interfaces import UpstreamStatusError
+from reef.runtime.interfaces import InferenceOverloaded, UpstreamStatusError
 from reef.service.request_service import InferenceRetryTimeout
 from reef.storage.records import RecordConflict
 from reef.surface.weights import RuntimeLoadMismatch
@@ -67,10 +68,18 @@ def _translate_upstream(exc: UpstreamStatusError) -> web.HTTPError:
     return web.HTTPBadGateway(text=str(exc))
 
 
+def _translate_overloaded(exc: InferenceOverloaded) -> web.HTTPError:
+    """Reef's own capacity decision, not an upstream failure: 503 plus a retry hint."""
+    retry_after = max(1, math.ceil(exc.retry_after_s))
+    return web.HTTPServiceUnavailable(text=str(exc), headers={"Retry-After": str(retry_after)})
+
+
 def translate_error(exc: Exception) -> web.HTTPError | None:
     """The HTTP error for a domain exception, or None when it is not mapped."""
     if isinstance(exc, UpstreamStatusError):  # before the table: status is dynamic
         return _translate_upstream(exc)
+    if isinstance(exc, InferenceOverloaded):  # before ReefError: server-side 503, not a 400
+        return _translate_overloaded(exc)
     for error_type, http_error in ERROR_STATUS_TABLE:
         if isinstance(exc, error_type):
             return http_error(text=str(exc))

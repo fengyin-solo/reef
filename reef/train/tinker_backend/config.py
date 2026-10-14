@@ -26,6 +26,9 @@ class TinkerConfig:
     inference_timeout_s: float = config_option(300.0)
     train_timeout_s: float | None = config_option(None)
     max_staleness: int = config_option(0)
+    max_active: int | None = config_option(None)
+    max_waiting: int | None = config_option(None)
+    retry_after_s: float = config_option(1.0)
 
     def __post_init__(self) -> None:
         if not self.state_dir.strip() or not self.api_key_env.strip():
@@ -40,3 +43,9 @@ class TinkerConfig:
             raise ValueError("Tinker currently requires max_staleness=0")
         if self.inference_timeout_s <= 0 or (self.train_timeout_s is not None and self.train_timeout_s <= 0):
             raise ValueError("Tinker timeouts must be positive")
+        if self.max_active is not None and (isinstance(self.max_active, bool) or self.max_active < 1):
+            raise ValueError("Tinker max_active must be a positive integer")
+        if self.max_waiting is not None and (isinstance(self.max_waiting, bool) or self.max_waiting < 0):
+            raise ValueError("Tinker max_waiting must be a non-negative integer")
+        if self.retry_after_s <= 0:
+            raise ValueError("Tinker retry_after_s must be positive")

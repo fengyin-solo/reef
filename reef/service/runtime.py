@@ -40,6 +40,9 @@ CONNECTION_CONFIG_KEYS = (
     "inference_url",
     "inference_timeout_s",
     "max_staleness",
+    "max_active",
+    "max_waiting",
+    "retry_after_s",
     "inference_handler_factory",
     "inference_handler_config",
 )
@@ -55,6 +58,9 @@ def connect_executor_runtimes(
     model_path: str = "",
     inference_timeout_s: float = 300.0,
     max_staleness: int = 0,
+    max_active: int | None = None,
+    max_waiting: int | None = None,
+    retry_after_s: float = 1.0,
     inference_handler_factory: type[InferenceHandler] = HttpInferenceHandler,
     inference_handler_config: Mapping[str, Any] | None = None,
 ) -> tuple[TrainingRuntime, InferenceRuntime]:
@@ -68,6 +74,9 @@ def connect_executor_runtimes(
             inference_url=inference_url,
             model_path=model_path,
             inference_timeout_s=inference_timeout_s,
+            max_active=max_active,
+            max_waiting=max_waiting,
+            retry_after_s=retry_after_s,
             inference_handler_factory=inference_handler_factory,
             inference_handler_config=inference_handler_config,
         )
@@ -84,6 +93,9 @@ def connect_ray_runtime(
     inference_timeout_s: float = 300.0,
     train_timeout_s: float | None = None,
     max_staleness: int = 0,
+    max_active: int | None = None,
+    max_waiting: int | None = None,
+    retry_after_s: float = 1.0,
     inference_handler_factory: type[InferenceHandler] = HttpInferenceHandler,
     inference_handler_config: Mapping[str, Any] | None = None,
 ) -> tuple[TrainingRuntime, InferenceRuntime]:
@@ -105,6 +117,9 @@ def connect_ray_runtime(
         model_path=model_path,
         inference_timeout_s=inference_timeout_s,
         max_staleness=max_staleness,
+        max_active=max_active,
+        max_waiting=max_waiting,
+        retry_after_s=retry_after_s,
         inference_handler_factory=inference_handler_factory,
         inference_handler_config=inference_handler_config,
     )

@@ -942,12 +942,26 @@ def test_inference_admission_controller_blocks_cancellation_without_leaking_a_ha
         queued.cancel()
         with pytest.raises(asyncio.CancelledError):
             await queued
-        assert controller.status == {"open": False, "active": 1}
+        assert controller.status == {
+            "open": False,
+            "active": 1,
+            "waiting": 0,
+            "rejected_total": 0,
+            "max_active": None,
+            "max_waiting": None,
+        }
         admitted.release()
         controller.open()
         next_handle = await asyncio.wait_for(controller.acquire(), 1)
         next_handle.release()
-        assert controller.status == {"open": True, "active": 0}
+        assert controller.status == {
+            "open": True,
+            "active": 0,
+            "waiting": 0,
+            "rejected_total": 0,
+            "max_active": None,
+            "max_waiting": None,
+        }
 
     asyncio.run(run())
 
@@ -965,7 +979,14 @@ def test_noncolocated_weight_update_preserves_inflight_and_queues_new_requests_u
     assert handle.calls == ["execute", "update_weights"]
     assert runtime.serving_runtime_load_id() == "engine:1"
     assert runtime.current_runtime_load_id() == "engine:0"
-    assert runtime.inference_admission_status == {"open": False, "active": 1}
+    assert runtime.inference_admission_status == {
+        "open": False,
+        "active": 1,
+        "waiting": 0,
+        "rejected_total": 0,
+        "max_active": None,
+        "max_waiting": None,
+    }
 
     async def commit_and_admit() -> None:
         queued = asyncio.create_task(runtime.acquire_inference())
@@ -982,7 +1003,14 @@ def test_noncolocated_weight_update_preserves_inflight_and_queues_new_requests_u
     inflight.release()
     assert handle.calls == ["execute", "update_weights", "acknowledge"]
     assert runtime.current_runtime_load_id() == "engine:1"
-    assert runtime.inference_admission_status == {"open": True, "active": 0}
+    assert runtime.inference_admission_status == {
+        "open": True,
+        "active": 0,
+        "waiting": 0,
+        "rejected_total": 0,
+        "max_active": None,
+        "max_waiting": None,
+    }
 
 
 @pytest.mark.unit
@@ -1013,14 +1041,35 @@ def test_colocated_weight_update_retracts_without_draining_inflight() -> None:
     result = runtime.execute_training_job({"rollout_id": 0})
 
     assert handle.calls == ["execute", "update_weights"]
-    assert runtime.inference_admission_status == {"open": False, "active": 1}
+    assert runtime.inference_admission_status == {
+        "open": False,
+        "active": 1,
+        "waiting": 0,
+        "rejected_total": 0,
+        "max_active": None,
+        "max_waiting": None,
+    }
     assert runtime.serving_runtime_load_id() == "engine:1"
     assert runtime.current_runtime_load_id() == "engine:0"
     runtime.reconcile_training_job(scenario_step=1, committed_training_job_id=result.training_job_id)
-    assert runtime.inference_admission_status == {"open": True, "active": 1}
+    assert runtime.inference_admission_status == {
+        "open": True,
+        "active": 1,
+        "waiting": 0,
+        "rejected_total": 0,
+        "max_active": None,
+        "max_waiting": None,
+    }
     assert runtime.current_runtime_load_id() == "engine:1"
     inflight.release()
-    assert runtime.inference_admission_status == {"open": True, "active": 0}
+    assert runtime.inference_admission_status == {
+        "open": True,
+        "active": 0,
+        "waiting": 0,
+        "rejected_total": 0,
+        "max_active": None,
+        "max_waiting": None,
+    }
 
 
 @pytest.mark.unit
@@ -1037,7 +1086,14 @@ def test_colocated_weight_update_does_not_wait_for_inference_timeout() -> None:
 
     assert result.training_job_id == handle.training_job_id
     assert handle.calls == ["execute", "update_weights"]
-    assert runtime.inference_admission_status == {"open": False, "active": 1}
+    assert runtime.inference_admission_status == {
+        "open": False,
+        "active": 1,
+        "waiting": 0,
+        "rejected_total": 0,
+        "max_active": None,
+        "max_waiting": None,
+    }
     runtime.reconcile_training_job(scenario_step=1, committed_training_job_id=result.training_job_id)
     inflight.release()
 
@@ -1057,7 +1113,14 @@ def test_colocated_checkpoint_rejection_reopens_admission_when_backend_stayed_id
         runtime.execute_training_job({"rollout_id": 0})
 
     assert handle.calls == ["execute"]
-    assert runtime.inference_admission_status == {"open": True, "active": 0}
+    assert runtime.inference_admission_status == {
+        "open": True,
+        "active": 0,
+        "waiting": 0,
+        "rejected_total": 0,
+        "max_active": None,
+        "max_waiting": None,
+    }
 
 
 @pytest.mark.unit
@@ -1074,8 +1137,22 @@ def test_running_training_closes_only_colocated_inference_admission() -> None:
     disjoint.reconcile_training_job(scenario_step=0)
     colocated.reconcile_training_job(scenario_step=0)
 
-    assert disjoint.inference_admission_status == {"open": True, "active": 0}
-    assert colocated.inference_admission_status == {"open": False, "active": 0}
+    assert disjoint.inference_admission_status == {
+        "open": True,
+        "active": 0,
+        "waiting": 0,
+        "rejected_total": 0,
+        "max_active": None,
+        "max_waiting": None,
+    }
+    assert colocated.inference_admission_status == {
+        "open": False,
+        "active": 0,
+        "waiting": 0,
+        "rejected_total": 0,
+        "max_active": None,
+        "max_waiting": None,
+    }
     assert disjoint.current_runtime_load_id() == "engine:0"
     assert colocated.current_runtime_load_id() is None
 
@@ -1148,7 +1225,14 @@ def test_colocated_completed_checkpoint_replay_reopens_admission() -> None:
 
     assert result.outcome == "complete"
     assert handle.calls == ["execute"]
-    assert runtime.inference_admission_status == {"open": True, "active": 0}
+    assert runtime.inference_admission_status == {
+        "open": True,
+        "active": 0,
+        "waiting": 0,
+        "rejected_total": 0,
+        "max_active": None,
+        "max_waiting": None,
+    }
 
 
 @pytest.mark.unit
@@ -1162,7 +1246,14 @@ def test_recovery_acknowledges_a_training_job_after_the_scenario_commit() -> Non
     )
 
     assert handle.calls == ["acknowledge"]
-    assert runtime.inference_admission_status == {"open": True, "active": 0}
+    assert runtime.inference_admission_status == {
+        "open": True,
+        "active": 0,
+        "waiting": 0,
+        "rejected_total": 0,
+        "max_active": None,
+        "max_waiting": None,
+    }
 
 
 @pytest.mark.unit
@@ -1176,7 +1267,14 @@ def test_recovery_does_not_acknowledge_an_unrelated_later_commit() -> None:
     )
 
     assert handle.calls == []
-    assert runtime.inference_admission_status == {"open": False, "active": 0}
+    assert runtime.inference_admission_status == {
+        "open": False,
+        "active": 0,
+        "waiting": 0,
+        "rejected_total": 0,
+        "max_active": None,
+        "max_waiting": None,
+    }
 
 
 @pytest.mark.unit
@@ -1192,18 +1290,39 @@ def test_legacy_complete_marker_stays_closed_until_reef_commit_is_proven() -> No
 
     runtime.reconcile_training_job(scenario_step=3)
     assert handle.calls == []
-    assert runtime.inference_admission_status == {"open": False, "active": 0}
+    assert runtime.inference_admission_status == {
+        "open": False,
+        "active": 0,
+        "waiting": 0,
+        "rejected_total": 0,
+        "max_active": None,
+        "max_waiting": None,
+    }
 
     runtime.reconcile_training_job(scenario_step=4)
     assert handle.calls == []
-    assert runtime.inference_admission_status == {"open": False, "active": 0}
+    assert runtime.inference_admission_status == {
+        "open": False,
+        "active": 0,
+        "waiting": 0,
+        "rejected_total": 0,
+        "max_active": None,
+        "max_waiting": None,
+    }
 
     runtime.reconcile_training_job(
         scenario_step=4,
         committed_training_without_job_id=True,
     )
     assert handle.calls == ["acknowledge"]
-    assert runtime.inference_admission_status == {"open": True, "active": 0}
+    assert runtime.inference_admission_status == {
+        "open": True,
+        "active": 0,
+        "waiting": 0,
+        "rejected_total": 0,
+        "max_active": None,
+        "max_waiting": None,
+    }
 
 
 @pytest.mark.unit
@@ -1223,7 +1342,14 @@ def test_legacy_complete_marker_does_not_trust_an_unrelated_later_training_commi
     )
 
     assert handle.calls == []
-    assert runtime.inference_admission_status == {"open": False, "active": 0}
+    assert runtime.inference_admission_status == {
+        "open": False,
+        "active": 0,
+        "waiting": 0,
+        "rejected_total": 0,
+        "max_active": None,
+        "max_waiting": None,
+    }
 
 
 @pytest.mark.unit
@@ -1235,7 +1361,14 @@ def test_recovery_republishes_an_uncertain_partial_weight_update_before_commit()
 
     assert handle.calls == ["update_weights"]
     assert handle.status == "READY_TO_COMMIT"
-    assert runtime.inference_admission_status == {"open": False, "active": 0}
+    assert runtime.inference_admission_status == {
+        "open": False,
+        "active": 0,
+        "waiting": 0,
+        "rejected_total": 0,
+        "max_active": None,
+        "max_waiting": None,
+    }
 
 
 @pytest.mark.unit
@@ -1443,11 +1576,25 @@ def test_stream_and_failure_release_their_inference_admission_handles() -> None:
             "/v1/chat/completions",
             StreamingBackend(),
         )
-        assert runtime.inference_admission_status == {"open": True, "active": 0}
+        assert runtime.inference_admission_status == {
+            "open": True,
+            "active": 0,
+            "waiting": 0,
+            "rejected_total": 0,
+            "max_active": None,
+            "max_waiting": None,
+        }
         assert pending.admission is None
         await stream.close()
         service.record_stream(pending, {"stream": True, "complete": True})
-        assert runtime.inference_admission_status == {"open": True, "active": 0}
+        assert runtime.inference_admission_status == {
+            "open": True,
+            "active": 0,
+            "waiting": 0,
+            "rejected_total": 0,
+            "max_active": None,
+            "max_waiting": None,
+        }
 
         deferred, deferred_pending = await service.start_stream(
             {"x-reef-scenario": "math"},
@@ -1455,13 +1602,27 @@ def test_stream_and_failure_release_their_inference_admission_handles() -> None:
             "/v1/chat/completions",
             DeferredStreamingBackend(),
         )
-        assert runtime.inference_admission_status == {"open": True, "active": 1}
+        assert runtime.inference_admission_status == {
+            "open": True,
+            "active": 1,
+            "waiting": 0,
+            "rejected_total": 0,
+            "max_active": None,
+            "max_waiting": None,
+        }
         body = b"".join([chunk async for chunk in deferred.chunks])
         recorded = stream_record(deferred, body, complete=True)
         item = service.record_stream(deferred_pending, recorded)
         assert item.payload["runtime_load_id"] == "engine:0"
         assert Scenario.operations.snapshot()["serve/request/completed_total"] == 2
-        assert runtime.inference_admission_status == {"open": True, "active": 0}
+        assert runtime.inference_admission_status == {
+            "open": True,
+            "active": 0,
+            "waiting": 0,
+            "rejected_total": 0,
+            "max_active": None,
+            "max_waiting": None,
+        }
 
         mismatched, mismatched_pending = await service.start_stream(
             {"x-reef-scenario": "math"},
@@ -1489,7 +1650,14 @@ def test_stream_and_failure_release_their_inference_admission_handles() -> None:
                 "/v1/chat/completions",
                 UnverifiableStreamingBackend(),
             )
-        assert runtime.inference_admission_status == {"open": True, "active": 0}
+        assert runtime.inference_admission_status == {
+            "open": True,
+            "active": 0,
+            "waiting": 0,
+            "rejected_total": 0,
+            "max_active": None,
+            "max_waiting": None,
+        }
 
         with pytest.raises(RuntimeError, match="backend failed"):
             await service.infer(
@@ -1498,7 +1666,14 @@ def test_stream_and_failure_release_their_inference_admission_handles() -> None:
                 "/v1/chat/completions",
                 FailingBackend(),
             )
-        assert runtime.inference_admission_status == {"open": True, "active": 0}
+        assert runtime.inference_admission_status == {
+            "open": True,
+            "active": 0,
+            "waiting": 0,
+            "rejected_total": 0,
+            "max_active": None,
+            "max_waiting": None,
+        }
 
     asyncio.run(run())
 

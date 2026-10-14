@@ -176,8 +176,17 @@ class TinkerInferenceRuntime(InferenceRuntime):
         base_model: str,
         base_url: str = TINKER_URL,
         inference_timeout_s: float = 300.0,
+        max_active: int | None = None,
+        max_waiting: int | None = None,
+        retry_after_s: float = 1.0,
     ) -> None:
-        super().__init__(base_url=base_url, inference_timeout_s=inference_timeout_s)
+        super().__init__(
+            base_url=base_url,
+            inference_timeout_s=inference_timeout_s,
+            max_active=max_active,
+            max_waiting=max_waiting,
+            retry_after_s=retry_after_s,
+        )
         self._sampler = sampler
         self._model = base_model
         self._handler = TinkerInferenceHandler(self, sampler, base_model)
@@ -455,10 +464,23 @@ class TinkerInferenceConfig:
     api_key_env: str | None = config_option("TINKER_API_KEY", help="Environment variable holding the Tinker API key.")
     project_id: str | None = config_option(None, help="Optional Tinker project ID.")
     timeout_s: float = config_option(300.0, help="Sampling request timeout in seconds.")
+    max_active: int | None = config_option(None, help="Maximum concurrent sampling requests; omitted is unbounded.")
+    max_waiting: int | None = config_option(
+        None, help="Maximum requests that may wait for a slot; omitted is unbounded."
+    )
+    retry_after_s: float = config_option(
+        1.0, help="Suggested Retry-After interval in seconds when sampling is overloaded."
+    )
 
     def __post_init__(self) -> None:
         if self.timeout_s <= 0:
             raise ValueError("runtime.timeout_s must be positive")
+        if self.max_active is not None and (isinstance(self.max_active, bool) or self.max_active < 1):
+            raise ValueError("runtime.max_active must be a positive integer")
+        if self.max_waiting is not None and (isinstance(self.max_waiting, bool) or self.max_waiting < 0):
+            raise ValueError("runtime.max_waiting must be a non-negative integer")
+        if self.retry_after_s <= 0:
+            raise ValueError("runtime.retry_after_s must be positive")
 
 
 class TinkerInferenceRuntimeFactory(RuntimeFactory):
@@ -483,7 +505,14 @@ class TinkerInferenceRuntimeFactory(RuntimeFactory):
             model_path, api_key=key, project_id=config.get("project_id"), timeout_s=config["timeout_s"]
         )
         try:
-            return TinkerInferenceRuntime(sampler, base_model=model_path, inference_timeout_s=config["timeout_s"])
+            return TinkerInferenceRuntime(
+                sampler,
+                base_model=model_path,
+                inference_timeout_s=config["timeout_s"],
+                max_active=config.get("max_active"),
+                max_waiting=config.get("max_waiting"),
+                retry_after_s=config.get("retry_after_s", 1.0),
+            )
         except BaseException:
             sampler.close()
             raise

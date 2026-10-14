@@ -26,6 +26,9 @@ TRAINING_CONFIG_KEYS = (
 INFERENCE_CONFIG_KEYS = (
     "inference_url",
     "inference_timeout_s",
+    "max_active",
+    "max_waiting",
+    "retry_after_s",
     "inference_handler_factory",
     "inference_handler_config",
 )

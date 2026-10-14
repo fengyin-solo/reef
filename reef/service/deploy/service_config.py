@@ -133,6 +133,21 @@ class ServiceConfig:
         public_path=("inference", "retry_timeout_s"),
         help="Retry deadline in seconds; defaults to the inference timeout.",
     )
+    inference_max_concurrency: int | None = config_option(
+        None,
+        public_path=("inference", "max_concurrency"),
+        help="Maximum concurrent inference requests; omitted is unbounded.",
+    )
+    inference_queue_limit: int | None = config_option(
+        None,
+        public_path=("inference", "queue_limit"),
+        help="Maximum requests allowed to wait for an inference slot; omitted is unbounded.",
+    )
+    inference_overload_retry_after_s: float = config_option(
+        1.0,
+        public_path=("inference", "overload_retry_after_s"),
+        help="Suggested Retry-After in seconds returned when concurrency and queue are full.",
+    )
     artifact_repository: str = config_option(
         ".reef/artifacts.git", public_path=("storage", "artifact_repository"), help="Artifact repository location."
     )
@@ -198,6 +213,16 @@ class ServiceConfig:
 
     def __post_init__(self) -> None:
         RecordRetention(self.agent_record_retention_days, self.agent_record_retention_max_bytes)
+        if self.inference_max_concurrency is not None and (
+            isinstance(self.inference_max_concurrency, bool) or self.inference_max_concurrency < 1
+        ):
+            raise ValueError("reef.inference_max_concurrency must be a positive integer")
+        if self.inference_queue_limit is not None and (
+            isinstance(self.inference_queue_limit, bool) or self.inference_queue_limit < 0
+        ):
+            raise ValueError("reef.inference_queue_limit must be a non-negative integer")
+        if self.inference_overload_retry_after_s <= 0:
+            raise ValueError("reef.inference_overload_retry_after_s must be positive")
         if self.record_backend not in {"sqlite", "postgres"}:
             raise ValueError("reef.record_backend must be sqlite or postgres")
         if self.record_backend == "postgres":

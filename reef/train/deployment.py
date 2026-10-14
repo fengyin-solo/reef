@@ -252,7 +252,17 @@ class InProcessTrainingDeployment(TrainingDeployment):
             key.replace("-", "_"): value
             for key, value in normalize_native_options(settings["training_backend_options"]).items()
         }
-        managed = {"type", "model_path", "inference_timeout_s", "train_timeout_s", "max_staleness", "connect"}
+        managed = {
+            "type",
+            "model_path",
+            "inference_timeout_s",
+            "train_timeout_s",
+            "max_staleness",
+            "max_active",
+            "max_waiting",
+            "retry_after_s",
+            "connect",
+        }
         if managed & options.keys():
             raise DeployConfigError("training.options cannot override managed runtime fields")
         return {
@@ -261,4 +271,7 @@ class InProcessTrainingDeployment(TrainingDeployment):
             "inference_timeout_s": settings["inference_timeout_s"],
             "train_timeout_s": settings["train_timeout_s"],
             "max_staleness": max_staleness,
+            "max_active": settings["inference_max_concurrency"],
+            "max_waiting": settings["inference_queue_limit"],
+            "retry_after_s": settings["inference_overload_retry_after_s"],
         }

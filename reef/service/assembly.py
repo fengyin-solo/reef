@@ -100,6 +100,9 @@ def _upstream_runtime(settings: ServiceConfig) -> InferenceRuntime | None:
         api_key=settings.upstream_api_key or None,
         api=settings.upstream_api,
         inference_timeout_s=settings.inference_timeout_s,
+        max_active=settings.inference_max_concurrency,
+        max_waiting=settings.inference_queue_limit,
+        retry_after_s=settings.inference_overload_retry_after_s,
     )
 
 

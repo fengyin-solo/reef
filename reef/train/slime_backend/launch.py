@@ -143,6 +143,9 @@ class SlimeDeployment(TrainingDeployment):
             "ray_address": ray_address,
             "inference_timeout_s": settings["inference_timeout_s"],
             "train_timeout_s": settings["train_timeout_s"],
+            "max_active": settings["inference_max_concurrency"],
+            "max_waiting": settings["inference_queue_limit"],
+            "retry_after_s": settings["inference_overload_retry_after_s"],
         }
         if max_staleness:
             runtime_config["max_staleness"] = max_staleness

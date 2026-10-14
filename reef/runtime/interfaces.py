@@ -25,8 +25,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import uuid
 from abc import ABC, abstractmethod
+from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import AbstractContextManager, suppress
 from dataclasses import dataclass, field
@@ -255,6 +257,19 @@ class TrainingJobState:
 # -- Request admission --------------------------------------------------------
 
 
+class InferenceOverloaded(ReefError):
+    """The server turned a new inference away because concurrency and the waiting queue are full.
+
+    This is Reef's own capacity decision, never an upstream engine failure:
+    the service answers immediately with a 503 and a ``Retry-After`` interval
+    instead of letting the request queue and then time out.
+    """
+
+    def __init__(self, retry_after_s: float) -> None:
+        super().__init__(f"inference is overloaded; retry after {retry_after_s:g}s")
+        self.retry_after_s = retry_after_s
+
+
 class InferenceAdmissionHandle(InferenceLease):
     """A handle for one admitted inference, released after model execution."""
 
@@ -269,56 +284,139 @@ class InferenceAdmissionHandle(InferenceLease):
         self._controller.release()
 
 
+class _AdmissionWaiter:
+    """One queued request, woken by the controller when a slot reaches it."""
+
+    __slots__ = ("event", "granted")
+
+    def __init__(self) -> None:
+        self.event = asyncio.Event()
+        self.granted = False
+
+
 class InferenceAdmissionController:
     """Thread-safe inference admission shared by async requests and training.
 
-    Requests await one event-loop-local event without occupying worker
-    threads. Training closes admission from its serial worker thread; an
-    integration may optionally drain admitted work before a destructive
-    backend operation.
+    A bounded number of requests hold execution slots at once; requests past
+    that bound wait FIFO in a queue of bounded length, and a request that finds
+    both the slots and the queue full is rejected immediately with
+    :class:`InferenceOverloaded`. Requests await per-queue events without
+    occupying worker threads; cancelling a waiting request removes it from the
+    queue. Training closes admission from its serial worker thread; an
+    integration may optionally drain admitted work before a destructive backend
+    operation. Closed admission parks requests in the same queue, and reopening
+    grants them in arrival order.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        max_active: int | None = None,
+        max_waiting: int | None = None,
+        retry_after_s: float = 1.0,
+    ) -> None:
+        if max_active is not None and (
+            isinstance(max_active, bool) or not isinstance(max_active, int) or max_active < 1
+        ):
+            raise ValueError("inference admission max_active must be a positive integer or None")
+        if max_waiting is not None and (
+            isinstance(max_waiting, bool) or not isinstance(max_waiting, int) or max_waiting < 0
+        ):
+            raise ValueError("inference admission max_waiting must be a non-negative integer or None")
+        if (
+            not isinstance(retry_after_s, (int, float))
+            or isinstance(retry_after_s, bool)
+            or not math.isfinite(retry_after_s)
+            or retry_after_s <= 0
+        ):
+            raise ValueError("inference admission retry_after_s must be a positive finite number")
         self._condition = Condition()
         self._open = True
         self._active = 0
+        self._max_active = max_active
+        self._max_waiting = max_waiting
+        self._retry_after_s = float(retry_after_s)
+        self._waiters: deque[_AdmissionWaiter] = deque()
+        self._rejected_total = 0
         self._loop: asyncio.AbstractEventLoop | None = None
-        self._open_event: asyncio.Event | None = None
 
     async def acquire(self) -> InferenceAdmissionHandle:
-        """Wait until admission is open, then count one active request."""
+        """Take a free slot immediately, else wait FIFO; raise when the queue is full."""
         loop = asyncio.get_running_loop()
+        waiter: _AdmissionWaiter | None = None
         while True:
             with self._condition:
-                event = self._bind_loop(loop)
-                if self._open:
-                    self._active += 1
+                self._bind_loop(loop)
+                if waiter is None:
+                    if not self._waiters and self._open and self._has_capacity():
+                        self._active += 1
+                        return InferenceAdmissionHandle(self)
+                    if self._queue_full():
+                        self._rejected_total += 1
+                        raise InferenceOverloaded(self._retry_after_s)
+                    waiter = _AdmissionWaiter()
+                    self._waiters.append(waiter)
+                elif waiter.granted:
                     return InferenceAdmissionHandle(self)
-            await event.wait()
-            # ``close`` clears the asyncio event on its owning loop. If this
-            # task raced the thread-safe callback, a still-set event would
-            # otherwise make this loop spin without yielding and prevent the
-            # clear callback from ever running.
-            await asyncio.sleep(0)
+            try:
+                await waiter.event.wait()
+            except asyncio.CancelledError:
+                self._cancel_waiter(waiter)
+                raise
 
-    def _bind_loop(self, loop: asyncio.AbstractEventLoop) -> asyncio.Event:
-        """Return the open event for ``loop``, creating it on first use. Caller holds the lock."""
+    def _bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Remember the one loop whose tasks await admission. Caller holds the lock."""
         if self._loop is None or self._loop.is_closed():
             self._loop = loop
-            self._open_event = asyncio.Event()
-            if self._open:
-                self._open_event.set()
         elif self._loop is not loop:
             raise RuntimeError("inference admission cannot span concurrent event loops")
-        if self._open_event is None:
-            raise RuntimeError("closed inference admission has no loop event")
-        return self._open_event
+
+    def _has_capacity(self) -> bool:
+        """Whether one more request may execute. Caller holds the lock."""
+        return self._max_active is None or self._active < self._max_active
+
+    def _queue_full(self) -> bool:
+        """Whether a new request must be rejected instead of queued. Caller holds the lock."""
+        return self._max_waiting is not None and len(self._waiters) >= self._max_waiting
+
+    def _grant_waiters(self) -> None:
+        """Hand free slots to queued requests in arrival order. Caller holds the lock."""
+        while self._waiters and self._open and self._has_capacity():
+            waiter = self._waiters.popleft()
+            waiter.granted = True
+            self._active += 1
+            self._signal_waiter(waiter)
+
+    def _cancel_waiter(self, waiter: _AdmissionWaiter) -> None:
+        """Drop a disconnecting request from the queue, returning any slot it won."""
+        with self._condition:
+            if waiter.granted:
+                # The slot was granted before the cancellation was observed; no
+                # handle reaches the caller, so give the slot straight back.
+                self._active -= 1
+                self._grant_waiters()
+                if self._active == 0:
+                    self._condition.notify_all()
+            else:
+                self._waiters.remove(waiter)
+
+    def _signal_waiter(self, waiter: _AdmissionWaiter) -> None:
+        """Wake one queued request on its loop; admission grants from worker threads."""
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
+        # The loop can close between is_closed() and scheduling.
+        with suppress(RuntimeError):
+            loop.call_soon_threadsafe(waiter.event.set)
 
     def close(self, *, wait: bool = False, timeout: float | None = None) -> None:
-        """Reject new admissions and optionally drain already admitted work."""
+        """Reject new admissions and optionally drain already admitted work.
+
+        Queued requests keep their places and resume, in arrival order, when
+        admission reopens; they do not count as active work for draining.
+        """
         with self._condition:
             self._open = False
-            self._signal_loop(is_open=False)
             if wait and not self._condition.wait_for(lambda: self._active == 0, timeout=timeout):
                 raise TimeoutError("timed out waiting for admitted inference requests to drain")
 
@@ -326,29 +424,28 @@ class InferenceAdmissionController:
         """Admit queued and future requests."""
         with self._condition:
             self._open = True
+            self._grant_waiters()
             self._condition.notify_all()
-            self._signal_loop(is_open=True)
-
-    def _signal_loop(self, *, is_open: bool) -> None:
-        """Mirror the open flag onto the loop's event, if a loop is still running."""
-        loop, event = self._loop, self._open_event
-        if loop is None or event is None or loop.is_closed():
-            return
-        # The loop can close between is_closed() and scheduling.
-        with suppress(RuntimeError):
-            loop.call_soon_threadsafe(event.set if is_open else event.clear)
 
     @property
     def status(self) -> Mapping[str, Any]:
         with self._condition:
-            return {"open": self._open, "active": self._active}
+            return {
+                "open": self._open,
+                "active": self._active,
+                "waiting": len(self._waiters),
+                "rejected_total": self._rejected_total,
+                "max_active": self._max_active,
+                "max_waiting": self._max_waiting,
+            }
 
     def release(self) -> None:
-        """Count one admitted request as finished; wakes a draining ``close``."""
+        """Count one admitted request as finished and promote the next waiter."""
         with self._condition:
             if self._active <= 0:
                 raise RuntimeError("inference admission handle released without an active request")
             self._active -= 1
+            self._grant_waiters()
             if self._active == 0:
                 self._condition.notify_all()
 
@@ -456,14 +553,26 @@ class InferenceRuntime(AdapterWeightRuntime):
     training and optimizer state belong to a separate TrainingRuntime.
     """
 
-    def __init__(self, *, base_url: str, inference_timeout_s: float = 300.0) -> None:
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        inference_timeout_s: float = 300.0,
+        max_active: int | None = None,
+        max_waiting: int | None = None,
+        retry_after_s: float = 1.0,
+    ) -> None:
         if not base_url:
             raise ValueError("base_url must be non-empty")
         if inference_timeout_s <= 0:
             raise ValueError("inference_timeout_s must be positive")
         self._base_url = base_url.rstrip("/")
         self._inference_timeout_s = inference_timeout_s
-        self._inference_admission = InferenceAdmissionController()
+        self._inference_admission = InferenceAdmissionController(
+            max_active=max_active,
+            max_waiting=max_waiting,
+            retry_after_s=retry_after_s,
+        )
         self._current_runtime_load_id: str | None = None
 
     # -- Requests

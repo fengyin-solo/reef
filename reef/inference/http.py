@@ -214,8 +214,17 @@ class InferenceProxyRuntime(InferenceRuntime):
         api_key: str | None = None,
         api: str = "openai",
         inference_timeout_s: float = 300.0,
+        max_active: int | None = None,
+        max_waiting: int | None = None,
+        retry_after_s: float = 1.0,
     ) -> None:
-        super().__init__(base_url=base_url, inference_timeout_s=inference_timeout_s)
+        super().__init__(
+            base_url=base_url,
+            inference_timeout_s=inference_timeout_s,
+            max_active=max_active,
+            max_waiting=max_waiting,
+            retry_after_s=retry_after_s,
+        )
         if api not in PROVIDER_APIS:
             raise ValueError(f"inference proxy api must be one of {PROVIDER_APIS}, got {api!r}")
         self._model_path = model_path
@@ -296,12 +305,25 @@ class InferenceProxyConfig:
     api_key: str | None = config_option(None, help="Provider credential.")
     api_key_env: str | None = config_option(None, help="Environment variable containing the provider credential.")
     timeout_s: float = config_option(300.0, help="Inference request timeout in seconds.")
+    max_active: int | None = config_option(None, help="Maximum concurrent inference requests; omitted is unbounded.")
+    max_waiting: int | None = config_option(
+        None, help="Maximum requests allowed to wait for a slot; omitted is unbounded."
+    )
+    retry_after_s: float = config_option(
+        1.0, help="Suggested Retry-After interval in seconds when the server is overloaded."
+    )
 
     def __post_init__(self) -> None:
         if not self.base_url:
             raise ValueError("runtime.base_url must be a non-empty string")
         if self.timeout_s <= 0:
             raise ValueError("runtime.timeout_s must be positive")
+        if self.max_active is not None and (isinstance(self.max_active, bool) or self.max_active < 1):
+            raise ValueError("runtime.max_active must be a positive integer")
+        if self.max_waiting is not None and (isinstance(self.max_waiting, bool) or self.max_waiting < 0):
+            raise ValueError("runtime.max_waiting must be a non-negative integer")
+        if self.retry_after_s <= 0:
+            raise ValueError("runtime.retry_after_s must be positive")
 
 
 class InferenceProxyRuntimeFactory(RuntimeFactory):
@@ -325,6 +347,9 @@ class InferenceProxyRuntimeFactory(RuntimeFactory):
             api_key=config_secret(config, environ, "api_key", "api_key_env"),
             api=config["api"],
             inference_timeout_s=config["timeout_s"],
+            max_active=config.get("max_active"),
+            max_waiting=config.get("max_waiting"),
+            retry_after_s=config["retry_after_s"],
         )
 
 
