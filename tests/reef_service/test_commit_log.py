@@ -9,6 +9,8 @@ the crash windows around the commit point and assert each is recoverable.
 from __future__ import annotations
 
 import hashlib
+import hmac
+import json
 import logging
 import os
 import time
@@ -29,8 +31,19 @@ from reef.harness.episodes.model_binding import ModelBinding
 from reef.recipe.base import Recipe
 from reef.recipe.checkpoint_strategy import CheckpointStrategy, EveryNVersions
 from reef.runtime.interfaces import ActivatedModel, ModelCandidate, PreparedTrainingStep
-from reef.storage.commit_log import RECORD_KIND, CommitLog, CommitLogError, CommitLogScenarioStore
-from reef.storage.commits import CommitRecord
+from reef.storage.commit_log import (
+    RECORD_KIND,
+    CommitLog,
+    CommitLogError,
+    CommitLogIntegrityReport,
+    CommitLogScenarioStore,
+)
+from reef.storage.commits import (
+    INTEGRITY_ALGORITHM,
+    INTEGRITY_FIELD,
+    CommitRecord,
+    canonical_commit_payload,
+)
 from reef.storage.sqlite import SQLiteScenarioStorage
 from reef.surface import Surface
 from reef.surface.harnesses import create_harness_surface
@@ -329,6 +342,318 @@ def test_records_reject_corruption_before_the_tail(tmp_path) -> None:
 
     with pytest.raises(CommitLogError, match="line 2"):
         log.records()
+
+
+def _legacy_line(record: CommitRecord) -> str:
+    return json.dumps(record.to_dict(), ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def _rewrite_line(path: Path, line_index: int, value: dict) -> None:
+    lines = path.read_text(encoding="utf-8").splitlines()
+    lines[line_index] = json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _tamper_semantic_field(value: dict, field: str) -> None:
+    if field == "scenario":
+        value["scenario"] = "math-tampered"
+    elif field == "step":
+        value["step"] = 9
+    elif field == "release":
+        value["artifact_ref"]["release_id"] = "forged:release"
+    elif field == "watermark":
+        value["record_progress"]["high_water_sequence"] = 999
+    elif field == "consumed":
+        value["record_progress"]["consumed_ids"] = ["i9"]
+    elif field == "pending":
+        value["pending"] = True
+    else:  # pragma: no cover - defensive, parametrize lists every case
+        raise AssertionError(f"unknown tamper field {field}")
+
+
+@pytest.mark.unit
+def test_appended_lines_carry_and_verify_per_record_integrity(tmp_path) -> None:
+    path = tmp_path / "commits.jsonl"
+    log = CommitLog(path)
+    first = sample_record(step=1)
+    log.append(first)
+    assert first.integrity_verified is True
+
+    key_path = log.integrity_key_path
+    assert key_path.exists()
+    assert key_path.stat().st_mode & 0o777 == 0o600
+    key = bytes.fromhex(key_path.read_text(encoding="ascii"))
+
+    raw_line = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
+    envelope = raw_line[INTEGRITY_FIELD]
+    assert envelope["alg"] == INTEGRITY_ALGORITHM
+    assert len(envelope["digest"]) == 64
+    # The digest is the HMAC over every semantic field of the line.
+    expected = hmac.new(key, canonical_commit_payload(raw_line), hashlib.sha256).hexdigest()
+    assert envelope["digest"] == expected
+
+    log.append(sample_record(step=2, runtime_load_id="w2"))
+    assert [record.integrity_verified for record in log.records()] == [True, True]
+    # A fresh reader (a process restart) authenticates the same history.
+    fresh_records = CommitLog(path).records()
+    assert [record.integrity_verified for record in fresh_records] == [True, True]
+
+    report = log.check_integrity()
+    assert isinstance(report, CommitLogIntegrityReport)
+    assert report.ok
+    assert (report.last_step, report.first_bad_line, report.reason, report.torn_tail) == (2, None, None, False)
+    assert (report.verified_lines, report.legacy_lines) == (2, 0)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("field", ["scenario", "step", "release", "watermark", "consumed", "pending"])
+def test_records_reject_a_schema_valid_line_with_one_tampered_field(tmp_path, field: str) -> None:
+    path = tmp_path / "commits.jsonl"
+    log = CommitLog(path)
+    log.append(sample_record(step=1))
+    log.append(sample_record(step=2, runtime_load_id="w2"))
+
+    raw = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
+    _tamper_semantic_field(raw, field)
+    _rewrite_line(path, 0, raw)
+    tampered_bytes = path.read_bytes()
+
+    fresh = CommitLog(path)
+    with pytest.raises(CommitLogError, match=r"line 1:.*integrity"):
+        fresh.records()
+    # The failure is reported read-only, with the line and reason, and the
+    # check itself never modifies the file.
+    report = fresh.check_integrity()
+    assert path.read_bytes() == tampered_bytes
+    assert not report.ok
+    assert report.first_bad_line == 1
+    assert report.last_step == 0
+    assert report.torn_tail is False
+    assert "integrity" in (report.reason or "")
+    # A complete line that fails integrity is corruption: appending must not
+    # truncate it as if it were a torn tail.
+    with pytest.raises(CommitLogError, match="line 1"):
+        fresh.append(sample_record(step=3, runtime_load_id="w3"))
+    assert path.read_bytes() == tampered_bytes
+
+
+@pytest.mark.unit
+def test_integrity_covers_the_operation_type(tmp_path) -> None:
+    path = tmp_path / "commits.jsonl"
+    log = CommitLog(path)
+    log.append(
+        CommitRecord(
+            scenario="math",
+            step=1,
+            artifact_ref=ArtifactRef("artifact:1", "checkpoint:1", "checkpoint:0"),
+            checkpoint=True,
+            algorithm_state=None,
+            high_water_sequence=0,
+            high_water_offset=0,
+            operation="rollback",
+            rollback_target_release_id="checkpoint:0",
+        )
+    )
+    # promote is schema-valid with the same rollback_target_release_id, so the
+    # only thing wrong with the line is its integrity envelope.
+    raw = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
+    raw["operation"] = "promote"
+    _rewrite_line(path, 0, raw)
+
+    fresh = CommitLog(path)
+    with pytest.raises(CommitLogError, match=r"line 1:.*integrity"):
+        fresh.records()
+    report = fresh.check_integrity()
+    assert report.first_bad_line == 1
+    assert "integrity" in (report.reason or "")
+
+
+@pytest.mark.unit
+def test_tampered_last_line_is_corruption_not_a_torn_tail(tmp_path) -> None:
+    path = tmp_path / "commits.jsonl"
+    log = CommitLog(path)
+    log.append(sample_record(step=1))
+    log.append(sample_record(step=2, runtime_load_id="w2"))
+
+    raw = json.loads(path.read_text(encoding="utf-8").splitlines()[1])
+    raw["artifact_ref"]["release_id"] = "forged:release"
+    _rewrite_line(path, 1, raw)
+
+    fresh = CommitLog(path)
+    report = fresh.check_integrity()
+    assert not report.ok
+    assert report.torn_tail is False
+    assert report.first_bad_line == 2
+    assert report.last_step == 1
+    with pytest.raises(CommitLogError, match="line 2"):
+        fresh.records()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "edit",
+    ["unknown_algorithm", "non_hex_digest", "short_digest", "envelope_not_object"],
+)
+def test_malformed_integrity_envelope_is_corruption(tmp_path, edit: str) -> None:
+    path = tmp_path / "commits.jsonl"
+    log = CommitLog(path)
+    log.append(sample_record(step=1))
+
+    raw = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
+    if edit == "unknown_algorithm":
+        raw[INTEGRITY_FIELD]["alg"] = "HMAC-SHA512"
+    elif edit == "non_hex_digest":
+        raw[INTEGRITY_FIELD]["digest"] = "z" * 64
+    elif edit == "short_digest":
+        raw[INTEGRITY_FIELD]["digest"] = "ab12"
+    else:
+        raw[INTEGRITY_FIELD] = "HMAC-SHA256"
+    _rewrite_line(path, 0, raw)
+
+    fresh = CommitLog(path)
+    with pytest.raises(CommitLogError, match="line 1"):
+        fresh.records()
+    report = fresh.check_integrity()
+    assert report.first_bad_line == 1
+    assert not report.ok and report.torn_tail is False
+
+
+@pytest.mark.unit
+def test_line_with_duplicate_json_keys_is_rejected(tmp_path) -> None:
+    path = tmp_path / "commits.jsonl"
+    log = CommitLog(path)
+    log.append(sample_record(step=1))
+
+    line = path.read_text(encoding="utf-8").splitlines()[0]
+    duplicated = line.replace('"scenario":"math"', '"scenario":"math","scenario":"other"', 1)
+    path.write_text(duplicated + "\n", encoding="utf-8")
+
+    fresh = CommitLog(path)
+    with pytest.raises(CommitLogError, match="line 1"):
+        fresh.records()
+    report = fresh.check_integrity()
+    assert report.first_bad_line == 1
+    assert "duplicate JSON key" in (report.reason or "")
+
+
+@pytest.mark.unit
+def test_legacy_lines_without_an_envelope_remain_readable_but_unverified(tmp_path) -> None:
+    path = tmp_path / "commits.jsonl"
+    first = sample_record(step=1)
+    second = sample_record(step=2, runtime_load_id="w2")
+    path.write_text(_legacy_line(first) + "\n" + _legacy_line(second) + "\n", encoding="utf-8")
+
+    log = CommitLog(path)
+    records = log.records()
+    assert [record.step for record in records] == [1, 2]
+    assert all(not record.integrity_verified for record in records)
+
+    report = log.check_integrity()
+    assert report.ok
+    assert (report.last_step, report.verified_lines, report.legacy_lines) == (2, 0, 2)
+    assert report.first_bad_line is None
+    # Reading legacy history never mints a key or changes the file.
+    assert not log.integrity_key_path.exists()
+    original_bytes = path.read_bytes()
+
+    third = sample_record(step=3, runtime_load_id="w3")
+    log.append(third)
+    assert third.integrity_verified is True
+    assert log.integrity_key_path.exists()
+
+    fresh = CommitLog(path)
+    records = fresh.records()
+    assert [record.integrity_verified for record in records] == [False, False, True]
+    report = fresh.check_integrity()
+    assert report.ok
+    assert (report.last_step, report.verified_lines, report.legacy_lines) == (3, 1, 2)
+    # Legacy bytes are left byte-identical; only the new line is sealed.
+    lines = path.read_bytes().splitlines()
+    assert lines[0] == original_bytes.splitlines()[0]
+    assert INTEGRITY_FIELD not in json.loads(lines[0])
+    assert INTEGRITY_FIELD in json.loads(lines[2])
+
+
+@pytest.mark.unit
+def test_check_integrity_reports_a_torn_tail_read_only_and_append_repairs_it(tmp_path) -> None:
+    path = tmp_path / "commits.jsonl"
+    log = CommitLog(path)
+    log.append(sample_record(step=1))
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write('{"record":"reef-commit/5","scenario":"ma')
+
+    before_bytes = path.read_bytes()
+    report = log.check_integrity()
+    assert not report.ok
+    assert report.torn_tail is True
+    assert report.first_bad_line is None
+    assert report.last_step == 1
+    assert report.verified_lines == 1
+    assert "line 2" in (report.reason or "")
+    # The check is strictly read-only, and so is a normal read.
+    assert path.read_bytes() == before_bytes
+    assert [record.step for record in log.records()] == [1]
+    assert path.read_bytes() == before_bytes
+
+    log.append(sample_record(step=2, runtime_load_id="w2"))
+    fresh = CommitLog(path)
+    assert [record.step for record in fresh.records()] == [1, 2]
+    report = fresh.check_integrity()
+    assert report.ok
+    assert not report.torn_tail
+    assert report.last_step == 2
+
+
+@pytest.mark.unit
+def test_records_fail_closed_when_the_integrity_key_is_missing(tmp_path) -> None:
+    path = tmp_path / "commits.jsonl"
+    log = CommitLog(path)
+    log.append(sample_record(step=1))
+    key_path = log.integrity_key_path
+    key_path.unlink()
+
+    fresh = CommitLog(path)
+    with pytest.raises(CommitLogError, match="line 1"):
+        fresh.records()
+    report = fresh.check_integrity()
+    assert not report.ok
+    assert report.first_bad_line == 1
+    assert "key" in (report.reason or "")
+    # Appending must not silently mint a replacement key and treat the sealed
+    # history as authentic.
+    with pytest.raises(CommitLogError, match="line 1"):
+        fresh.append(sample_record(step=2, runtime_load_id="w2"))
+    assert not key_path.exists()
+
+
+@pytest.mark.unit
+def test_integrity_rejects_a_line_copied_from_another_log(tmp_path) -> None:
+    path_a = tmp_path / "a.commits.jsonl"
+    path_b = tmp_path / "b.commits.jsonl"
+    CommitLog(path_a).append(sample_record(step=1))
+    CommitLog(path_b).append(sample_record(step=1))
+
+    # The payloads are byte-identical; only the per-log keys differ.
+    line_from_a = path_a.read_text(encoding="utf-8").splitlines()[0]
+    path_b.write_text(line_from_a + "\n", encoding="utf-8")
+
+    fresh_b = CommitLog(path_b)
+    with pytest.raises(CommitLogError, match="line 1"):
+        fresh_b.records()
+    report = fresh_b.check_integrity()
+    assert report.first_bad_line == 1
+    assert not report.ok
+
+
+@pytest.mark.unit
+def test_check_integrity_on_a_missing_log_reports_empty_without_creating_files(tmp_path) -> None:
+    path = tmp_path / "commits.jsonl"
+    report = CommitLog(path).check_integrity()
+    assert report.ok
+    assert (report.last_step, report.first_bad_line, report.torn_tail) == (0, None, False)
+    assert (report.verified_lines, report.legacy_lines) == (0, 0)
+    assert not path.exists()
+    assert not CommitLog(path).integrity_key_path.exists()
 
 
 class RecordingRuntime(StubTrainingRuntime):

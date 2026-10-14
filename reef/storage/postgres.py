@@ -349,6 +349,13 @@ class PostgresScenarioStorage(ScenarioStorage):
                 target = destination / path.name
                 shutil.move(str(path), str(target))
                 archived.append(str(target))
+            key_path = self._log_key_path(storage_id)
+            if key_path.exists():
+                destination = self._directory / "archived" / f"postgres-{storage_id}"
+                destination.mkdir(parents=True, exist_ok=True)
+                target = destination / key_path.name
+                shutil.move(str(key_path), str(target))
+                archived.append(str(target))
             return tuple(archived)
 
     def prune(self, *, days: float, max_bytes: int) -> int:
@@ -364,6 +371,9 @@ class PostgresScenarioStorage(ScenarioStorage):
 
     def _log_path(self, storage_id: str) -> Path:
         return self._directory / f"postgres-{storage_id}.commits.jsonl"
+
+    def _log_key_path(self, storage_id: str) -> Path:
+        return self._directory / f"postgres-{storage_id}.commits.jsonl.key"
 
     def _ensure_open(self) -> None:
         if self._closed:

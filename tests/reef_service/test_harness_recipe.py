@@ -983,9 +983,13 @@ def test_pregate_recovered_state_refuses_the_step_and_writes_nothing(tmp_path: P
 
     # Rewrite the committed record as a pre-gate workdir holds it: the seed
     # entry names the key inline. This file is the only one with key bytes.
+    # Drop the integrity envelope too: such a record predates per-record
+    # integrity, so recovery reads it as an unverified legacy line rather than
+    # as a sealed line that was modified.
     log_path = agent_record_dir / f"{hashlib.sha256(b'pregate-476').hexdigest()}.commits.jsonl"
     record = json.loads(log_path.read_bytes().splitlines()[-1])
     record["algorithm_state"]["entries"][0]["config"]["data"]["providers"]["qwen"]["apiKey"] = key
+    record.pop("integrity", None)
     log_path.write_bytes(json.dumps(record, separators=(",", ":"), sort_keys=True).encode() + b"\n")
     before = {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
 

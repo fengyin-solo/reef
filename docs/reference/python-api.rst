@@ -427,6 +427,18 @@ compaction and uses all committed ``consumed_ids`` to keep retained audit rows
 out of training. A future database adapter can commit the step and record
 progress together in one database transaction.
 
+Each committed line carries an HMAC-SHA256 ``integrity`` envelope over all of
+its semantic fields, keyed by the mode-0600 ``<log>.commits.jsonl.key``
+sidecar that ``CommitLog`` creates on its first append. Reads authenticate
+every sealed line and raise ``CommitLogError`` on a mismatch, even for the last
+line; only an unparseable final line is a torn tail, repaired on the next
+append. Envelope-less legacy lines load normally with
+``CommitRecord.integrity_verified`` set to ``False``. ``check_integrity()``
+returns a read-only ``CommitLogIntegrityReport`` (``ok``, ``last_step``,
+``first_bad_line``, ``reason``, ``torn_tail``, ``verified_lines``,
+``legacy_lines``) for pre-recovery verification; it never creates the key or
+changes the log, and a missing key makes sealed lines fail closed.
+
 Artifact bytes and backend head movement remain outside ``ScenarioStore``.
 ``ScenarioCommitter`` owns their order around store settlement, including
 pending releases, rollback, and checkpoint reconciliation. See `Commit ordering

@@ -5,6 +5,13 @@ CommitLogScenarioStore combines it with an injected RecordStore. The log
 append is the durable commit point; interrupted record compaction is repaired
 on retry or recovery. Stable POSIX file locks serialize commit writers across
 sessions and processes. Artifact publication remains outside this module.
+
+Each written line carries an HMAC-SHA256 integrity envelope over all of its
+semantic fields, keyed by a per-log secret kept in a mode-0600 sidecar file.
+Reads authenticate every envelope-bearing line; legacy lines without an
+envelope stay readable but are marked unverified
+(``CommitRecord.integrity_verified``). A schema-valid line whose envelope does
+not match is corruption, not a torn tail, and is rejected.
 """
 
 from __future__ import annotations
@@ -12,34 +19,90 @@ from __future__ import annotations
 import itertools
 import json
 import os
+import secrets
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from threading import RLock
 
 from reef.core.errors import ReefError
-from reef.storage.commits import RECORD_KIND, CommitLogError, CommitRecord
+from reef.storage.commits import (
+    INTEGRITY_FIELD,
+    INTEGRITY_KEY_BYTES,
+    RECORD_KIND,
+    CommitLogError,
+    CommitRecord,
+    build_commit_integrity,
+    validate_commit_integrity,
+)
 from reef.storage.records import RecordStore
 from reef.storage.scenario import ScenarioStore, ScenarioStoreConflict
+
+
+@dataclass(frozen=True)
+class CommitLogIntegrityReport:
+    """Outcome of a read-only integrity check over one commit log.
+
+    ``ok`` is False for a rejected line or for a torn tail; legacy lines
+    without an envelope do not fail the check but are counted separately.
+    ``last_step`` is the step of the last record that could be trusted: the
+    last record in the file, or the one immediately before the first bad line
+    or torn tail.
+    """
+
+    ok: bool
+    last_step: int
+    first_bad_line: int | None
+    reason: str | None
+    torn_tail: bool
+    verified_lines: int
+    legacy_lines: int
+
+
+@dataclass(frozen=True)
+class _LogScan:
+    records: tuple[CommitRecord, ...]
+    complete: bool
+    bad_line: int | None
+    reason: str | None
+    verified_lines: int
+    legacy_lines: int
+
+
+def _reject_duplicate_json_keys(pairs: Sequence[tuple[str, object]]) -> dict[str, object]:
+    seen: set[str] = set()
+    for key, _ in pairs:
+        if key in seen:
+            raise ValueError(f"duplicate JSON key {key!r}")
+        seen.add(key)
+    return dict(pairs)
 
 
 class CommitLog:
     """Append-only JSONL commit log for one scenario.
 
-    Appends serialize the record to a single line and fsync before returning;
-    that is the commit point. Retrying the same scenario step is a no-op, while
+    Appends serialize the record to a single line carrying an HMAC-SHA256
+    integrity envelope and fsync before returning; that is the commit point.
+    The HMAC key is a per-log secret in a mode-0600 sidecar file, created on
+    the first append. Retrying the same scenario step is a no-op, while
     different content for an existing step is a conflict. Reads tolerate
-    exactly one torn tail (a crash mid-append) and reject corruption elsewhere.
+    exactly one torn tail (a crash mid-append) and reject corruption
+    elsewhere, including schema-valid lines whose integrity envelope does
+    not match.
     """
 
     def __init__(self, path: Path) -> None:
         self._path = Path(path)
         self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._key_path = self._path.with_name(f"{self._path.name}.key")
         self._lock = RLock()
         self._cached_records: list[CommitRecord] | None = None
         self._cached_steps: dict[int, CommitRecord] | None = None
         self._cached_snapshot: tuple[CommitRecord, ...] | None = None
         self._cached_signature: tuple[int, int, int, int] | None = None
+        self._integrity_key: bytes | None = None
+        self._integrity_key_loaded = False
         self._run_segment = 0
         self._run_step = 0
 
@@ -47,10 +110,12 @@ class CommitLog:
     def path(self) -> Path:
         return self._path
 
+    @property
+    def integrity_key_path(self) -> Path:
+        """Sidecar file holding the per-log HMAC secret for this log."""
+        return self._key_path
+
     def append(self, record: CommitRecord) -> None:
-        encoded = (
-            json.dumps(record.to_dict(), ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n"
-        ).encode("utf-8")
         with self._lock:
             self._truncate_partial_tail()
             previous_signature = self._file_signature()
@@ -72,10 +137,20 @@ class CommitLog:
                 raise CommitLogError(f"commit step {record.step} conflicts with its existing record")
             if records and record.step < records[-1].step:
                 raise CommitLogError(f"commit step {record.step} precedes existing step {records[-1].step}")
+            # Authenticate the history before minting a key: envelope-bearing
+            # lines without their sidecar key fail the reload above rather than
+            # getting silently re-keyed.
+            integrity_key = self._ensure_integrity_key()
+            payload = record.to_dict()
+            payload[INTEGRITY_FIELD] = build_commit_integrity(payload, integrity_key)
+            encoded = (json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n").encode(
+                "utf-8"
+            )
             with open(self._path, "ab") as handle:
                 handle.write(encoded)
                 handle.flush()
                 os.fsync(handle.fileno())
+            object.__setattr__(record, "integrity_verified", True)
             current_signature = self._file_signature()
             cached_records = self._cached_records
             if (
@@ -118,6 +193,76 @@ class CommitLog:
             if self._cached_records is not None and signature == self._cached_signature:
                 return self._run_segment, self._run_step
             return self._position(records)
+
+    def check_integrity(self) -> CommitLogIntegrityReport:
+        """Authenticate the log read-only and report where trust stops.
+
+        Never creates the key sidecar and never truncates a torn tail, so it
+        is safe to run before recovery. The report gives the last trusted
+        step, the first schema- or integrity-invalid line with its reason,
+        and counts of verified and legacy (envelope-less) lines.
+        """
+        with self._lock:
+            scan = self._scan_log()
+        last_step = scan.records[-1].step if scan.records else 0
+        torn_tail = not scan.complete and scan.bad_line is None
+        return CommitLogIntegrityReport(
+            ok=scan.bad_line is None and not torn_tail,
+            last_step=last_step,
+            first_bad_line=scan.bad_line,
+            reason=scan.reason,
+            torn_tail=torn_tail,
+            verified_lines=scan.verified_lines,
+            legacy_lines=scan.legacy_lines,
+        )
+
+    def _load_integrity_key(self) -> bytes | None:
+        """Return the per-log HMAC key, or None when the sidecar does not exist."""
+        if self._integrity_key_loaded:
+            return self._integrity_key
+        try:
+            raw = self._key_path.read_text(encoding="ascii")
+        except FileNotFoundError:
+            self._integrity_key = None
+            self._integrity_key_loaded = True
+            return None
+        key = self._decode_integrity_key(raw)
+        self._integrity_key = key
+        self._integrity_key_loaded = True
+        return key
+
+    @staticmethod
+    def _decode_integrity_key(raw: str) -> bytes:
+        try:
+            key = bytes.fromhex(raw.strip())
+        except ValueError as exc:
+            raise CommitLogError("commit log integrity key must be hexadecimal") from exc
+        if len(key) != INTEGRITY_KEY_BYTES:
+            raise CommitLogError(f"commit log integrity key must be {INTEGRITY_KEY_BYTES} bytes")
+        return key
+
+    def _ensure_integrity_key(self) -> bytes:
+        """Load the key, creating the mode-0600 sidecar on the first append."""
+        loaded = self._load_integrity_key()
+        if loaded is not None:
+            return loaded
+        key = secrets.token_bytes(INTEGRITY_KEY_BYTES)
+        try:
+            descriptor = os.open(self._key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError as exc:
+            # Another process created the sidecar between the read and the open.
+            self._integrity_key_loaded = False
+            loaded = self._load_integrity_key()
+            if loaded is None:
+                raise CommitLogError(f"commit log integrity key {self._key_path} exists but cannot be read") from exc
+            return loaded
+        with os.fdopen(descriptor, "w", encoding="ascii") as handle:
+            handle.write(key.hex())
+            handle.flush()
+            os.fsync(handle.fileno())
+        self._integrity_key = key
+        self._integrity_key_loaded = True
+        return key
 
     def _file_signature(self) -> tuple[int, int, int, int] | None:
         try:
@@ -195,27 +340,91 @@ class CommitLog:
             self._run_step += 1
 
     def _read_records(self) -> tuple[tuple[CommitRecord, ...], bool]:
+        scan = self._scan_log()
+        if scan.bad_line is not None:
+            raise CommitLogError(f"commit log {self._path} line {scan.bad_line}: {scan.reason}")
+        return scan.records, scan.complete
+
+    def _scan_log(self) -> _LogScan:
+        """Parse and authenticate every line without side effects.
+
+        Stops at the first schema- or integrity-invalid line. Only the final
+        line may be unparseable JSON, which is reported as a torn tail rather
+        than as a bad line: a complete, schema-valid line with a mismatching
+        envelope is corruption, even when it is the last line.
+        """
         if not self._path.exists():
-            return (), True
-        records: list[CommitRecord] = []
+            return _LogScan((), True, None, None, 0, 0)
         with open(self._path, encoding="utf-8") as handle:
             lines = handle.read().splitlines()
+        integrity_key = self._load_integrity_key()
+        records: list[CommitRecord] = []
+        verified_lines = 0
+        legacy_lines = 0
         for index, line in enumerate(lines):
             if not line.strip():
                 continue
+            line_number = index + 1
             try:
-                value = json.loads(line)
-            except json.JSONDecodeError as exc:
+                value = json.loads(line, object_pairs_hook=_reject_duplicate_json_keys)
+            except json.JSONDecodeError:
+                # A torn write is a prefix of one complete JSON object, so an
+                # incomplete document on the last line is the only shape a
+                # crash can leave; anything else, at any position, is corrupt.
                 if index == len(lines) - 1:
-                    return tuple(records), False  # torn tail from a crash mid-append
-                raise CommitLogError(f"commit log {self._path} has a corrupt record at line {index + 1}") from exc
+                    return _LogScan(
+                        tuple(records),
+                        False,
+                        None,
+                        f"torn tail at line {line_number}: a crash interrupted an append",
+                        verified_lines,
+                        legacy_lines,
+                    )
+                return self._bad_scan(records, line_number, "record is not valid JSON", verified_lines, legacy_lines)
+            except ValueError as exc:
+                # Structurally complete JSON rejected by the parse hooks
+                # (e.g. duplicate keys): corrupt even when it is the last line.
+                return self._bad_scan(
+                    records, line_number, f"record is not valid JSON: {exc}", verified_lines, legacy_lines
+                )
             if not isinstance(value, dict):
-                raise CommitLogError(f"commit log {self._path} line {index + 1} is not a record object")
+                return self._bad_scan(
+                    records, line_number, "record is not a JSON object", verified_lines, legacy_lines
+                )
             try:
-                records.append(CommitRecord.from_dict(value))
+                record = CommitRecord.from_dict(value)
             except CommitLogError as exc:
-                raise CommitLogError(f"commit log {self._path} line {index + 1}: {exc}") from exc
-        return tuple(records), True
+                return self._bad_scan(records, line_number, str(exc), verified_lines, legacy_lines)
+            if INTEGRITY_FIELD in value:
+                if integrity_key is None:
+                    return self._bad_scan(
+                        records,
+                        line_number,
+                        f"integrity envelope is present but the key file {self._key_path} is missing",
+                        verified_lines,
+                        legacy_lines,
+                    )
+                try:
+                    validate_commit_integrity(value, integrity_key)
+                except CommitLogError as exc:
+                    return self._bad_scan(records, line_number, str(exc), verified_lines, legacy_lines)
+                object.__setattr__(record, "integrity_verified", True)
+                verified_lines += 1
+            else:
+                # Legacy line: readable, but nothing proves who wrote it.
+                legacy_lines += 1
+            records.append(record)
+        return _LogScan(tuple(records), True, None, None, verified_lines, legacy_lines)
+
+    @staticmethod
+    def _bad_scan(
+        records: Sequence[CommitRecord],
+        line_number: int,
+        reason: str,
+        verified_lines: int,
+        legacy_lines: int,
+    ) -> _LogScan:
+        return _LogScan(tuple(records), True, line_number, reason, verified_lines, legacy_lines)
 
 
 class CommitLogScenarioStore(ScenarioStore):
@@ -412,4 +621,11 @@ class CommitLogScenarioStore(ScenarioStore):
         }
 
 
-__all__ = ["RECORD_KIND", "CommitLog", "CommitLogError", "CommitLogScenarioStore", "CommitRecord"]
+__all__ = [
+    "RECORD_KIND",
+    "CommitLog",
+    "CommitLogError",
+    "CommitLogIntegrityReport",
+    "CommitLogScenarioStore",
+    "CommitRecord",
+]

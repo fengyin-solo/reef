@@ -398,11 +398,16 @@ def test_storage_preserves_paths_archives_and_recreates_without_old_history(tmp_
         session.commit_step(expected_step=0, commit=commit())
     assert tmp_path / f"{key}.sqlite3" in factory.state_paths("math")
     assert tmp_path / f"{key}.commits.jsonl" in factory.state_paths("math")
+    assert tmp_path / f"{key}.commits.jsonl.key" in factory.state_paths("math")
 
     first_archive = factory.archive("math")
-    assert len(first_archive) == 2
+    assert len(first_archive) == 3
     assert all(Path(location).exists() for location in first_archive)
     assert (tmp_path / ".locks" / f"{key}.commits.jsonl.lock").exists()
+    # The integrity key moves beside the log, so archived history still
+    # authenticates instead of becoming unreadable.
+    archived_log = next(location for location in first_archive if location.endswith(".commits.jsonl"))
+    assert CommitLog(Path(archived_log)).check_integrity().ok
     with closing(factory.open("math")) as session:
         assert session.history() == ()
         assert session.records.count("math") == 0

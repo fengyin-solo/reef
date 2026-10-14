@@ -399,7 +399,13 @@ class SQLiteScenarioStorage(ScenarioStorage):
                 return ()
             return tuple(
                 self._directory / name
-                for name in (f"{key}.sqlite3", f"{key}.sqlite3-wal", f"{key}.sqlite3-shm", f"{key}.commits.jsonl")
+                for name in (
+                    f"{key}.sqlite3",
+                    f"{key}.sqlite3-wal",
+                    f"{key}.sqlite3-shm",
+                    f"{key}.commits.jsonl",
+                    f"{key}.commits.jsonl.key",
+                )
             )
 
     def close(self) -> None:

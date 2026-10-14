@@ -7,6 +7,9 @@ value types; training and storage operations remain with their callers.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
 import time
 from collections.abc import Mapping
 from copy import deepcopy
@@ -59,6 +62,53 @@ def parse_record_progress(value: object, *, context: str) -> RecordProgress:
 
 RECORD_KIND = "reef-commit/5"
 
+INTEGRITY_FIELD = "integrity"
+INTEGRITY_ALGORITHM = "HMAC-SHA256"
+INTEGRITY_KEY_BYTES = 32
+INTEGRITY_DIGEST_HEX_LENGTH = hashlib.sha256().digest_size * 2
+
+
+def canonical_commit_payload(value: Mapping[str, Any]) -> bytes:
+    """Return the canonical bytes an integrity digest is computed over.
+
+    The digest covers every persisted semantic field; the integrity envelope
+    itself is the only excluded key. Canonical JSON makes a line's digest
+    independent of key order and whitespace.
+    """
+    payload = {key: item for key, item in value.items() if key != INTEGRITY_FIELD}
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+
+
+def build_commit_integrity(payload: Mapping[str, Any], key: bytes) -> dict[str, str]:
+    """Build the per-record integrity envelope for one commit log line."""
+    digest = hmac.new(key, canonical_commit_payload(payload), hashlib.sha256).hexdigest()
+    return {"alg": INTEGRITY_ALGORITHM, "digest": digest}
+
+
+def validate_commit_integrity(value: Mapping[str, Any], key: bytes) -> None:
+    """Authenticate one parsed commit log line against its integrity envelope.
+
+    Raises CommitLogError when the envelope is malformed or its digest does not
+    match the payload recomputed with ``key``. Callers decide how to treat a
+    line that carries no envelope at all (a legacy record).
+    """
+    envelope = value.get(INTEGRITY_FIELD)
+    if not isinstance(envelope, Mapping):
+        raise CommitLogError("commit record integrity must be an object")
+    algorithm = envelope.get("alg")
+    if algorithm != INTEGRITY_ALGORITHM:
+        raise CommitLogError(f"unsupported commit record integrity algorithm: {algorithm!r}")
+    digest = envelope.get("digest")
+    if not isinstance(digest, str) or len(digest) != INTEGRITY_DIGEST_HEX_LENGTH:
+        raise CommitLogError(f"commit record integrity digest must be {INTEGRITY_DIGEST_HEX_LENGTH} hex characters")
+    try:
+        bytes.fromhex(digest)
+    except ValueError as exc:
+        raise CommitLogError("commit record integrity digest must be a hex string") from exc
+    expected_digest = hmac.new(key, canonical_commit_payload(value), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(digest, expected_digest):
+        raise CommitLogError("commit record integrity check failed: the record was modified after it was written")
+
 
 class CommitLogError(ReefError):
     """The commit log is corrupt or a record does not match the schema."""
@@ -91,6 +141,10 @@ class CommitRecord:
     rollback_target_release_id: str | None = None
     metrics: Mapping[str, Any] | None = None
     training_job_id: str | None = None
+    # Read-side attribute only: a parsed line is unverified until the commit
+    # log authenticates its integrity envelope. It is never part of to_dict,
+    # so it neither enters the digest nor participates in record equality.
+    integrity_verified: bool = True
 
     def __post_init__(self) -> None:
         if not isinstance(self.step, int) or isinstance(self.step, bool) or self.step < 1:
@@ -120,6 +174,8 @@ class CommitRecord:
             raise CommitLogError("commit record training_job_id must be a non-empty string or null")
         if self.operation != "training" and self.training_job_id is not None:
             raise CommitLogError("only training commits may carry training_job_id")
+        if not isinstance(self.integrity_verified, bool):
+            raise CommitLogError("commit record integrity_verified must be a boolean")
         # Own every mutable value the record was handed: the log is the durable
         # commit point, so a caller mutating its state or metrics afterwards
         # must not change what was recorded.
@@ -214,6 +270,9 @@ class CommitRecord:
             rollback_target_release_id=rollback_target_release_id,
             metrics=value.get("metrics"),
             training_job_id=value.get("training_job_id"),
+            # Parsing proves the shape, not the origin; the commit log marks
+            # the record verified only after its integrity envelope checks out.
+            integrity_verified=False,
         )
 
     def __eq__(self, other: object) -> bool:
@@ -341,13 +400,20 @@ def parse_scenario_metadata(
 
 
 __all__ = [
+    "INTEGRITY_ALGORITHM",
+    "INTEGRITY_DIGEST_HEX_LENGTH",
+    "INTEGRITY_FIELD",
+    "INTEGRITY_KEY_BYTES",
     "RECORD_KIND",
     "SCENARIO_METADATA_KEY",
     "SCENARIO_METADATA_KIND",
     "CommitLogError",
     "CommitRecord",
     "RecordProgress",
+    "build_commit_integrity",
+    "canonical_commit_payload",
     "parse_record_progress",
     "parse_scenario_metadata",
     "scenario_metadata_for",
+    "validate_commit_integrity",
 ]

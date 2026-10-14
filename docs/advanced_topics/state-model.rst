@@ -85,6 +85,24 @@ records its step number, artifact ref, checkpoint flag, algorithm state, record
 high-water mark, consumed record IDs, compaction retirements, metrics, and
 training job identity. Existing databases and logs require no conversion.
 
+Every newly appended line also carries an ``integrity`` envelope: an
+HMAC-SHA256 digest over the canonical serialization of all of that line's
+semantic fields, keyed by a per-log secret in a mode-0600 sidecar file
+(``<log>.commits.jsonl.key``). Readers recompute the digest, so a line that is
+still valid JSON with valid fields but was edited after writing — a changed
+release id, consumed set, high-water mark, scenario, step, or operation — is
+rejected as corruption, including when it is the last line. Only an
+unparseable final line is treated as a torn tail from a crash and discarded on
+the next append. Log lines written before this feature have no envelope: they
+still load but are marked unverified through
+``CommitRecord.integrity_verified``; mixing legacy and sealed lines in one log
+is supported. Losing the key sidecar fails closed: sealed lines can no longer
+be authenticated, so keep and archive it with the log. ``CommitLog.check_integrity()``
+is a read-only pre-recovery check reporting the last trusted step, the first
+line that fails schema or integrity validation with its reason, a torn-tail
+flag, and verified/legacy line counts; it neither creates the key nor truncates
+the log.
+
 ``commit_step(expected_step=..., commit=...)`` validates the expected scenario
 step before accepting its successor. Identical retries return the original
 commit; different content for that step or a stale expected step conflicts.
