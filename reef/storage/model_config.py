@@ -16,6 +16,8 @@ import time
 import uuid
 from pathlib import Path
 
+from reef.core.errors import ArchiveConflict, ArchiveCorrupt
+
 
 def _model_path(directory: Path | None, scenario: str) -> Path | None:
     if directory is None:
@@ -59,3 +61,24 @@ def archive_model_config(directory: Path | None, scenario: str) -> tuple[str, ..
     target = destination / path.name
     shutil.move(str(path), str(target))
     return (str(target),)
+
+
+def restore_model_config(directory: Path | None, archived_path: str, *, target: str) -> str:
+    """Copy an archived model settings file back under the restored scenario name.
+
+    Settings are name-independent, so restoring under a different name only
+    changes the file's hash prefix. The archived file is never removed here;
+    an occupied target is refused.
+    """
+    if directory is None:
+        raise ArchiveCorrupt("model settings were archived without a record directory")
+    source_file = Path(archived_path)
+    if not source_file.is_file():
+        raise ArchiveCorrupt(f"archived model settings file is missing: {archived_path}")
+    key = hashlib.sha256(target.encode("utf-8")).hexdigest()
+    destination = Path(directory) / f"{key}-model.json"
+    if destination.exists():
+        raise ArchiveConflict(f"model settings already exist for scenario {target!r}; refusing to overwrite them")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source_file, destination)
+    return str(destination)

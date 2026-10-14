@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import heapq
 import math
+import os
 import shutil
 import time
 import uuid
@@ -34,10 +35,10 @@ from sqlalchemy.engine import Connection
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.pool import NullPool
 
-from reef.core.errors import ReefError
-from reef.storage.commit_log import CommitLog, CommitLogScenarioStore
+from reef.core.errors import ArchiveConflict, ArchiveCorrupt, ReefError
+from reef.storage.commit_log import CommitLog, CommitLogScenarioStore, rewrite_commit_log_scenario
 from reef.storage.records import RecordRetention
-from reef.storage.scenario import ScenarioStorage
+from reef.storage.scenario import ScenarioStorage, StorageArchive
 from reef.storage.sql_records import RecordTables, SQLRecordRetention, SQLRecordStore
 
 _METADATA = MetaData()
@@ -367,14 +368,17 @@ class SQLiteScenarioStorage(ScenarioStorage):
                 records.close()
                 raise
 
-    def archive(self, scenario: str) -> tuple[str, ...]:
+    def archive(self, scenario: str) -> StorageArchive | None:
         with self._lock:
             self._ensure_open()
             paths = self.state_paths(scenario)
             if self._directory is None:
-                return ()
-            stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-            destination = self._directory / "archived" / f"{self._scenario_key(scenario)}-{stamp}-{uuid.uuid4().hex}"
+                return None
+            destination = (
+                self._directory
+                / "archived"
+                / f"{self._scenario_key(scenario)}-{self._archive_stamp()}-{uuid.uuid4().hex}"
+            )
             moved: list[str] = []
             for path in paths:
                 if path.exists():
@@ -382,13 +386,171 @@ class SQLiteScenarioStorage(ScenarioStorage):
                     target = destination / path.name
                     shutil.move(str(path), str(target))
                     moved.append(str(target))
-            return tuple(moved)
+            if not moved:
+                return None
+            return StorageArchive(locations=tuple(moved), token={"archived_dir": str(destination)})
+
+    def restore(
+        self,
+        archive: StorageArchive,
+        *,
+        source: str,
+        target: str,
+        settlement_receipt: str,
+    ) -> tuple[str, ...]:
+        with self._lock:
+            self._ensure_open()
+            if self._directory is None:
+                raise ArchiveCorrupt("in-memory storage has no archived generation to restore")
+            archived_dir = Path(archive.token.get("archived_dir", ""))
+            if not archived_dir.is_dir():
+                raise ArchiveCorrupt(f"archived storage directory is missing: {archived_dir}")
+            source_key = self._scenario_key(source)
+            target_key = self._scenario_key(target)
+            active_paths = tuple(
+                self._directory / f"{target_key}{suffix}"
+                for suffix in (".sqlite3", ".sqlite3-wal", ".sqlite3-shm", ".commits.jsonl")
+            )
+            if any(path.exists() for path in active_paths):
+                raise ArchiveConflict(
+                    f"scenario {target!r} already has an active record store; refusing to overwrite it"
+                )
+            staged_database, staged_commit_log = self._stage_archived_generation(
+                archived_dir, source_key, target_key, source=source, target=target
+            )
+            try:
+                self._settle_restored_generation(
+                    staged_database,
+                    target,
+                    source=source,
+                    rename=source != target,
+                    settlement_receipt=settlement_receipt,
+                )
+                database_destination = self._directory / f"{target_key}.sqlite3"
+                os.replace(staged_database, database_destination)
+                log_destination: Path | None = None
+                if staged_commit_log is not None:
+                    log_destination = self._directory / f"{target_key}.commits.jsonl"
+                    os.replace(staged_commit_log, log_destination)
+            finally:
+                shutil.rmtree(staged_database.parent, ignore_errors=True)
+            restored = [str(database_destination)]
+            if log_destination is not None:
+                restored.append(str(log_destination))
+            return tuple(restored)
+
+    def _stage_archived_generation(
+        self,
+        archived_dir: Path,
+        source_key: str,
+        target_key: str,
+        *,
+        source: str,
+        target: str,
+    ) -> tuple[Path, Path | None]:
+        """Copy an archived generation into a staging directory, rekeyed for the target name."""
+        if self._directory is None:
+            raise ArchiveCorrupt("in-memory storage has no directory to stage a restore in")
+        directory = self._directory
+        archived_database = archived_dir / f"{source_key}.sqlite3"
+        archived_commit_log = archived_dir / f"{source_key}.commits.jsonl"
+        if not archived_database.exists() and not archived_commit_log.exists():
+            raise ArchiveCorrupt(f"archived storage directory holds no generation for {source!r}: {archived_dir}")
+        staging = directory / ".restore-staging" / uuid.uuid4().hex
+        staging.mkdir(parents=True, exist_ok=False)
+        staged_database = staging / f"{target_key}.sqlite3"
+        staged_commit_log: Path | None = None
+        try:
+            if archived_database.exists():
+                shutil.copy2(archived_database, staged_database)
+            if archived_commit_log.exists():
+                staged_commit_log = staging / f"{target_key}.commits.jsonl"
+                if source == target:
+                    shutil.copy2(archived_commit_log, staged_commit_log)
+                else:
+                    rewrite_commit_log_scenario(archived_commit_log, staged_commit_log, source=source, target=target)
+            return staged_database, staged_commit_log
+        except BaseException:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
+
+    def _settle_restored_generation(
+        self,
+        staged_database: Path,
+        target: str,
+        *,
+        source: str,
+        rename: bool,
+        settlement_receipt: str,
+    ) -> None:
+        """Rewrite scenario identity and retire every restored record from training replay.
+
+        Restored rows stay readable through audit pages and keep their append
+        deduplication, but none of them can form a training batch: the scenario
+        is recovered with its committed watermark, so the records it archived
+        never re-enter the training queue. The archived database itself is not
+        touched; this runs on the staging copy.
+        """
+        if not staged_database.exists():
+            return
+        records = SQLiteRecordStore(staged_database)
+        try:
+            if rename:
+                with records._transaction(target, write=True) as connection:
+                    connection.execute(
+                        _AGENT_RECORD.update().where(_AGENT_RECORD.c.scenario == source).values(scenario=target)
+                    )
+                    connection.execute(
+                        _COMPACTION_RECEIPTS.update()
+                        .where(_COMPACTION_RECEIPTS.c.scenario == source)
+                        .values(scenario=target)
+                    )
+            retired: set[str] = set()
+            after_sequence = 0
+            while True:
+                # Audit pages include already-compacted rows; the cursor is the sequence.
+                rows = records.audit_page(target, after_sequence=after_sequence, limit=512)
+                if not rows:
+                    break
+                for stored in rows:
+                    if stored.compacted_at is None:
+                        retired.add(stored.item.agent_record_id)
+                after_sequence = rows[-1].sequence
+                if len(rows) < 512:
+                    break
+            if retired:
+                records.compact(
+                    target,
+                    frozenset(retired),
+                    receipt_id=settlement_receipt,
+                    receipt_metadata={"kind": "archive-restore", "source_scenario": source, "restored_as": target},
+                )
+            # Outside a write transaction: wal_checkpoint cannot run inside one. Flush the WAL into
+            # the database file so placing just the .sqlite3 copy loses nothing.
+            with records._lock:
+                records._connection.exec_driver_sql("PRAGMA wal_checkpoint(TRUNCATE)")
+                records._connection.commit()
+        finally:
+            records.close()
 
     def prune(self, *, days: float, max_bytes: int) -> int:
         with self._lock:
             self._ensure_open()
             retention = RecordRetention(days, max_bytes)
             return 0 if self._directory is None else SQLiteRecordRetention(retention).prune(self._directory)
+
+    def rollback_restore(
+        self,
+        archive: StorageArchive,
+        *,
+        target: str,
+        restored_locations: tuple[str, ...],
+    ) -> None:
+        with self._lock:
+            for location in restored_locations:
+                path = Path(location)
+                for suffix in ("", "-wal", "-shm"):
+                    Path(f"{path}{suffix}").unlink(missing_ok=True)
 
     def state_paths(self, scenario: str) -> tuple[Path, ...]:
         """Existing local state paths; the stable process lock is never moved."""
@@ -415,3 +577,7 @@ class SQLiteScenarioStorage(ScenarioStorage):
         if not isinstance(scenario, str) or not scenario:
             raise ValueError("scenario must be a non-empty string")
         return hashlib.sha256(scenario.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _archive_stamp() -> str:
+        return time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())

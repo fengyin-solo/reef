@@ -14,9 +14,11 @@ from pathlib import Path
 from threading import Lock, RLock
 from typing import Any
 
+from reef.artifact.artifact import ArtifactRef
 from reef.artifact.repository import (
     CachedRepositoryBackendFactory,
     EnumerableRepositoryBackendFactory,
+    RegistrationArchive,
     RepositoryBackendFactory,
 )
 from reef.core.errors import ReefError, UnknownScenario
@@ -25,8 +27,8 @@ from reef.observability import ExperimentTracker, NullExperimentTracker
 from reef.recipe.base import Recipe
 from reef.scenario.factory import ScenarioFactory
 from reef.scenario.scenario import Scenario
-from reef.storage.model_config import archive_model_config, read_model_config, write_model_config
-from reef.storage.scenario import ScenarioStorage
+from reef.storage.model_config import archive_model_config, read_model_config, restore_model_config, write_model_config
+from reef.storage.scenario import ScenarioStorage, StorageArchive
 
 
 class ScenarioRegistry:
@@ -120,6 +122,18 @@ class ScenarioRegistry:
         """True when the scenario is in the in-memory table (not just durable)."""
         with self._lock:
             return scenario in self._scenarios
+
+    def current_release(self, scenario: str) -> ArtifactRef:
+        """The release the scenario currently serves, before it is removed.
+
+        Reads the loaded instance when one exists, otherwise builds the
+        scenario's backend to read its durable head; building does not load a
+        Scenario or bind training.
+        """
+        current = self.get_optional(scenario)
+        if current is not None:
+            return current.repository.require_current_artifact()
+        return self._backend_factory(scenario).current()
 
     def get(self, scenario: str) -> Scenario:
         """Get a loaded scenario by name (must exist in memory)."""
@@ -252,20 +266,58 @@ class ScenarioRegistry:
             self._preload_errors.pop(scenario, None)
         return dropped
 
-    def archive_registration(self, scenario: str) -> tuple[str, ...]:
-        """Move the scenario's durable registration aside and forget its cached backend; what was archived."""
+    def archive_registration(self, scenario: str) -> RegistrationArchive | None:
+        """Move the scenario's durable registration aside and forget its cached backend."""
         if not isinstance(self._backend_factory, CachedRepositoryBackendFactory):
             raise NotImplementedError("this repository backend cannot archive a scenario")
         return self._backend_factory.archive_registration(scenario)
+
+    def restore_registration(self, archive: RegistrationArchive | None, *, source: str, target: str) -> str | None:
+        """Put an archived durable registration back under ``target`` before the scenario is resolved."""
+        if archive is None:
+            return None
+        if not isinstance(self._backend_factory, CachedRepositoryBackendFactory):
+            raise NotImplementedError("this repository backend cannot restore a scenario")
+        return self._backend_factory.restore_registration(archive, source=source, target=target)
+
+    def discard_archived_registration(self, archive: RegistrationArchive) -> None:
+        """Remove the archived registration pointer after its archive was consumed."""
+        if isinstance(self._backend_factory, CachedRepositoryBackendFactory):
+            self._backend_factory.discard_archived_registration(archive)
+
+    def delete_restored_registration(self, target: str) -> None:
+        """Remove a registration created by a restore that is rolling back."""
+        if isinstance(self._backend_factory, CachedRepositoryBackendFactory):
+            self._backend_factory.delete_registration(target)
 
     def forget_lock(self, scenario: str) -> None:
         """Release the per-scenario lock's slot once nothing holds it; a later create makes a fresh one."""
         with self._lock:
             self._scenario_locks.pop(scenario, None)
 
-    def archive_store(self, scenario: str) -> tuple[str, ...]:
-        archived = self._storage.archive(scenario)
-        return (*archived, *archive_model_config(self._agent_record_dir, scenario))
+    def archive_store(self, scenario: str) -> StorageArchive | None:
+        return self._storage.archive(scenario)
+
+    def restore_store(
+        self,
+        archive: StorageArchive,
+        *,
+        source: str,
+        target: str,
+        settlement_receipt: str,
+    ) -> tuple[str, ...]:
+        return self._storage.restore(archive, source=source, target=target, settlement_receipt=settlement_receipt)
+
+    def rollback_restored_store(
+        self, archive: StorageArchive, *, target: str, restored_locations: tuple[str, ...]
+    ) -> None:
+        self._storage.rollback_restore(archive, target=target, restored_locations=restored_locations)
+
+    def archive_model_settings(self, scenario: str) -> tuple[str, ...]:
+        return archive_model_config(self._agent_record_dir, scenario)
+
+    def restore_model_settings(self, archived_path: str, *, target: str) -> str:
+        return restore_model_config(self._agent_record_dir, archived_path, target=target)
 
     def loaded_scenarios(self) -> tuple[Scenario, ...]:
         """Return the currently loaded scenario instances as a tuple."""

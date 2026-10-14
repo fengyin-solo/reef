@@ -128,9 +128,12 @@ def test_delete_scenario_archives_its_records_and_commit_log(tmp_path) -> None:
     result = value.delete_scenario("delivery")
 
     assert not [path for path in record_dir.iterdir() if path.is_file()]
-    archived = list((record_dir / "archived").iterdir())
+    archived_root = record_dir / "archived"
+    assert (archived_root / "manifests").is_dir()
+    archived = [path for path in archived_root.iterdir() if path.name != "manifests"]
     assert len(archived) == 1 and any(path.name.endswith(".sqlite3") for path in archived[0].iterdir())
-    assert all(item.startswith(str(record_dir / "archived")) for item in result["archived"])
+    assert all(item.startswith(str(archived_root)) for item in result["archived"])
+    assert result["archive_id"]
     value.close()
 
 

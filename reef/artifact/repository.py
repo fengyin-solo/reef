@@ -7,6 +7,7 @@ import uuid
 from abc import ABC, abstractmethod
 from collections import OrderedDict
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
 from time import monotonic
@@ -19,6 +20,36 @@ from reef.artifact.artifact import (
     ArtifactRef,
     ArtifactRepository,
 )
+
+
+@dataclass(frozen=True)
+class RegistrationArchive:
+    """A scenario's durable registration moved aside by archiving.
+
+    ``locations`` are audit-facing refs or paths. ``token`` carries the
+    implementation-private coordinates :meth:`restore_registration` needs;
+    both stay JSON-serializable for the scenario archive manifest.
+    """
+
+    locations: tuple[str, ...]
+    token: Mapping[str, str]
+
+    def to_dict(self) -> dict[str, object]:
+        return {"locations": list(self.locations), "token": dict(self.token)}
+
+    @classmethod
+    def from_dict(cls, value: object) -> RegistrationArchive:
+        if not isinstance(value, dict):
+            raise ValueError("registration archive must be an object")
+        raw_locations = value.get("locations")
+        raw_token = value.get("token")
+        if not isinstance(raw_locations, list) or not all(isinstance(item, str) for item in raw_locations):
+            raise ValueError("registration archive locations must be a list of strings")
+        if not isinstance(raw_token, dict) or not all(
+            isinstance(key, str) and isinstance(item, str) for key, item in raw_token.items()
+        ):
+            raise ValueError("registration archive token must be an object of strings")
+        return cls(locations=tuple(raw_locations), token=dict(raw_token))
 
 
 class RepositoryBackend(ArtifactRepository):
@@ -139,18 +170,50 @@ class CachedRepositoryBackendFactory(RegistrationAwareRepositoryBackendFactory, 
             loaded = {name for name, backend in self._backends.items() if backend.metadata() is not None}
         return tuple(sorted(loaded | set(self._list_persisted_registrations())))
 
-    def archive_registration(self, scenario: str) -> tuple[str, ...]:
-        """Forget the scenario's backend and move its durable registration aside; what was archived, by name.
+    def archive_registration(self, scenario: str) -> RegistrationArchive | None:
+        """Forget the scenario's backend and move its durable registration aside.
 
         After this the factory answers ``has_registration`` false and
         ``list_registrations`` without the name, so a later create under the
         same name starts from the base artifact. Content-addressed storage
-        the scenario shared with others stays.
+        the scenario shared with others stays. ``None`` means there was no
+        durable registration to archive.
         """
         with self._lock:
             self._backends.pop(scenario, None)
             self._registration_misses.pop(scenario, None)
         return self._archive_persisted_registration(scenario)
+
+    def restore_registration(
+        self,
+        archive: RegistrationArchive | None,
+        *,
+        source: str,
+        target: str,
+    ) -> str | None:
+        """Put an archived durable registration back under ``target`` before the scenario is resolved.
+
+        Refuse when ``target`` is already registered; never overwrite an
+        existing scenario. Return the restored registration location, or
+        ``None`` when the backend holds nothing durable (the caller then
+        re-forks from the base artifact).
+        """
+        if archive is None or not archive.token:
+            return None
+        with self._lock:
+            self._backends.pop(source, None)
+            self._backends.pop(target, None)
+            self._registration_misses.pop(source, None)
+            self._registration_misses.pop(target, None)
+        return self._restore_persisted_registration(archive, source=source, target=target)
+
+    def discard_archived_registration(self, archive: RegistrationArchive) -> None:
+        """Delete the archived registration pointer after its archive was consumed."""
+        self._discard_archived_persisted_registration(archive)
+
+    def delete_registration(self, scenario: str) -> None:
+        """Delete a live scenario registration during a restore rollback; its commits stay in storage."""
+        self._delete_persisted_registration(scenario)
 
     @abstractmethod
     def _build_backend(self, scenario: str) -> RepositoryBackend: ...
@@ -161,9 +224,25 @@ class CachedRepositoryBackendFactory(RegistrationAwareRepositoryBackendFactory, 
     def _list_persisted_registrations(self) -> tuple[str, ...]:
         return ()
 
-    def _archive_persisted_registration(self, scenario: str) -> tuple[str, ...]:
-        """Move the durable registration aside; nothing to do for a backend that registers in memory only."""
-        return ()
+    def _archive_persisted_registration(self, scenario: str) -> RegistrationArchive | None:
+        """Move the durable registration aside; nothing durable for a memory-only backend."""
+        return None
+
+    def _restore_persisted_registration(
+        self,
+        archive: RegistrationArchive,
+        *,
+        source: str,
+        target: str,
+    ) -> str | None:
+        """Restore a durable registration; memory-only backends have nothing to restore."""
+        return None
+
+    def _discard_archived_persisted_registration(self, archive: RegistrationArchive) -> None:
+        """Nothing to discard for a memory-only backend."""
+
+    def _delete_persisted_registration(self, scenario: str) -> None:
+        """Nothing to delete for a memory-only backend."""
 
 
 class Repository(ArtifactRepository):

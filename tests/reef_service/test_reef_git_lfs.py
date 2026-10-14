@@ -333,11 +333,141 @@ def test_archiving_a_scenario_renames_its_ref_and_drops_its_work_clone(tmp_path:
 
     assert factory.list_registrations() == ("kept",)
     assert not factory.has_registration("doomed")
-    assert len(archived) == 2 and archived[0].startswith("refs/reef/archived/")
-    assert run_git("--git-dir", str(remote), "rev-parse", archived[0]) == doomed_ref.release_id
+    assert archived is not None
+    assert len(archived.locations) == 2 and archived.locations[0].startswith("refs/reef/archived/")
+    assert run_git("--git-dir", str(remote), "rev-parse", archived.locations[0]) == doomed_ref.release_id
     assert run_git("--git-dir", str(remote), "rev-parse", "refs/reef/base")
     assert not (tmp_path / "work" / encoded).exists()
     # The name creates fresh: a new backend forks the base again rather than continuing the archived chain.
     fresh = factory("doomed")
     assert fresh.metadata() is None
     assert fresh.fork().parent_release_id == run_git("--git-dir", str(remote), "rev-parse", "refs/reef/base")
+
+
+@pytest.mark.integration
+def test_restoring_a_registration_points_the_scenario_ref_back_at_its_commit(
+    tmp_path: Path, fake_git_lfs: None
+) -> None:
+    """Same-name restore re-creates the scenario ref at the archived commit and refuses to overwrite an occupant."""
+    from reef.core.errors import ArchiveConflict
+
+    remote = tmp_path / "artifacts.git"
+    factory = GitLFSRepositoryBackend.factory(remote, work_dir=tmp_path / "work", cache_dir=tmp_path / "cache")
+    forked = factory("svc").fork()
+    archived = factory.archive_registration("svc")
+    assert archived is not None
+
+    restored_ref = factory.restore_registration(archived, source="svc", target="svc")
+
+    encoded = base64.urlsafe_b64encode(b"svc").decode().rstrip("=")
+    assert restored_ref == f"refs/reef/scenarios/{encoded}"
+    assert run_git("--git-dir", str(remote), "rev-parse", restored_ref) == forked.release_id
+    # The archived pointer survives until the archive is explicitly consumed (rollback window).
+    assert run_git("--git-dir", str(remote), "rev-parse", archived.token["archived_ref"]) == forked.release_id
+    assert set(factory.list_registrations()) == {"svc"}
+    rebuilt = factory("svc")
+    assert rebuilt.current().release_id == forked.release_id
+
+    # While the restored ref stands, another restore cannot overwrite it.
+    with pytest.raises(ArchiveConflict, match="already exists"):
+        factory.restore_registration(archived, source="svc", target="svc")
+
+    factory.discard_archived_registration(archived)
+    remaining = run_git("--git-dir", str(remote), "for-each-ref", "--format=%(refname)", "refs/reef/archived/*")
+    assert remaining == ""
+
+
+@pytest.mark.integration
+def test_restoring_a_registration_under_a_new_name_keeps_the_release_chain(tmp_path: Path, fake_git_lfs: None) -> None:
+    """A renamed restore commits a metadata-only child whose parent is the archived commit."""
+    remote = tmp_path / "artifacts.git"
+    factory = GitLFSRepositoryBackend.factory(remote, work_dir=tmp_path / "work", cache_dir=tmp_path / "cache")
+    from reef.storage.commits import SCENARIO_METADATA_KEY
+
+    forked = factory("alpha").fork(
+        metadata={SCENARIO_METADATA_KEY: {"format": "reef-scenario/4", "scenario": "alpha"}}
+    )
+    archived = factory.archive_registration("alpha")
+    assert archived is not None
+
+    restored_ref = factory.restore_registration(archived, source="alpha", target="beta")
+
+    encoded_beta = base64.urlsafe_b64encode(b"beta").decode().rstrip("=")
+    encoded_alpha = base64.urlsafe_b64encode(b"alpha").decode().rstrip("=")
+    assert restored_ref == f"refs/reef/scenarios/{encoded_beta}"
+    alpha_refs = subprocess.run(
+        ["git", "--git-dir", str(remote), "rev-parse", "--verify", "--quiet", f"refs/reef/scenarios/{encoded_alpha}"],
+        check=False,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert alpha_refs == ""
+    new_sha = run_git("--git-dir", str(remote), "rev-parse", restored_ref)
+    assert new_sha != forked.release_id
+    # The renamed commit's parent is the archived release: the whole chain stays reachable.
+    parent = run_git("--git-dir", str(remote), "rev-parse", f"{new_sha}^")
+    assert parent == forked.release_id
+
+    backend = factory("beta")
+    metadata = backend.metadata()
+    assert metadata is not None
+    assert metadata[SCENARIO_METADATA_KEY]["scenario"] == "beta"
+    assert backend.current().release_id == new_sha
+    assert run_git("--git-dir", str(remote), "rev-parse", forked.release_id) == forked.release_id
+    factory.discard_archived_registration(archived)
+
+
+@pytest.mark.integration
+def test_dispatcher_restore_recovers_the_archived_git_registration(tmp_path: Path, fake_git_lfs: None) -> None:
+    """End-to-end: delete archives the git ref, restore serves the original release, repeat restore conflicts."""
+    from reef.artifact import GitLFSRepositoryBackend as GitFactory
+    from reef.core.errors import ArchiveConflict
+    from reef.dispatcher import Dispatcher
+    from reef.recipe import Recipe
+    from reef.storage.sqlite import SQLiteScenarioStorage
+
+    remote = tmp_path / "artifacts.git"
+    record_dir = tmp_path / "records"
+    factory = GitFactory.factory(remote, work_dir=tmp_path / "work", cache_dir=tmp_path / "cache")
+    dispatcher = Dispatcher(
+        Recipe(),
+        factory,
+        local_artifact_dir=tmp_path / "local",
+        agent_record_dir=record_dir,
+        scenario_storage=SQLiteScenarioStorage(record_dir),
+    )
+    try:
+        created = dispatcher.get_or_create_scenario("delivery")
+        assert created is not None
+        release_id = created.repository.require_current_artifact().release_id
+
+        deleted = dispatcher.delete_scenario("delivery")
+        assert not dispatcher.has_scenario("delivery")
+        remaining = run_git("--git-dir", str(remote), "for-each-ref", "--format=%(refname)", "refs/reef/scenarios/*")
+        assert remaining == ""
+
+        restored = dispatcher.restore_scenario(deleted["archive_id"])
+        assert restored["restored_as"] == "delivery"
+        assert restored["release_id"] == release_id
+        assert dispatcher.has_scenario("delivery")
+        # Consumed cleanup removed the archived pointer.
+        archived_refs = run_git(
+            "--git-dir", str(remote), "for-each-ref", "--format=%(refname)", "refs/reef/archived/*"
+        )
+        assert archived_refs == ""
+        with pytest.raises(ArchiveConflict, match="already restored"):
+            dispatcher.restore_scenario(deleted["archive_id"])
+
+        # Renamed restore for a second scenario resolves under the new name.
+        other = dispatcher.get_or_create_scenario("other")
+        assert other is not None
+        other_release = other.repository.require_current_artifact().release_id
+        deleted_other = dispatcher.delete_scenario("other")
+        renamed = dispatcher.restore_scenario(deleted_other["archive_id"], new_name="other-renamed")
+        assert renamed["restored_as"] == "other-renamed"
+        assert dispatcher.has_scenario("other-renamed")
+        encoded = base64.urlsafe_b64encode(b"other-renamed").decode().rstrip("=")
+        new_sha = run_git("--git-dir", str(remote), "rev-parse", f"refs/reef/scenarios/{encoded}")
+        assert run_git("--git-dir", str(remote), "rev-parse", f"{new_sha}^") == other_release
+    finally:
+        dispatcher.close()

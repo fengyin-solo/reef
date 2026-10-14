@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 from aiohttp import web
 
@@ -76,6 +77,32 @@ def register_scenario_routes(app: web.Application, *, request_service: RequestSe
 
     async def delete_scenario(request: web.Request) -> web.Response:
         result = await asyncio.to_thread(request_service.dispatcher.delete_scenario, request.match_info["scenario"])
+        return web.json_response(result)
+
+    async def list_archived_scenarios(request: web.Request) -> web.Response:
+        archives = await asyncio.to_thread(request_service.dispatcher.list_archived_scenarios)
+        return web.json_response({"archives": list(archives)}, headers={"Cache-Control": "no-store"})
+
+    async def restore_scenario(request: web.Request) -> web.Response:
+        archive_id = request.match_info["archive_id"]
+        raw = await request.read()
+        payload: dict[str, object] = {}
+        if raw.strip():
+            try:
+                decoded = json.loads(raw)
+            except ValueError as exc:
+                raise web.HTTPBadRequest(text="request body must be a JSON object") from exc
+            if not isinstance(decoded, dict):
+                raise web.HTTPBadRequest(text="request body must be a JSON object")
+            payload = decoded
+        if set(payload) - {"name"}:
+            raise ValueError("only a restore 'name' is accepted")
+        name = payload.get("name")
+        if name is not None and (not isinstance(name, str) or not name.strip()):
+            raise web.HTTPBadRequest(text="name must be a non-empty string when provided")
+        if isinstance(name, str):
+            name = name.strip()
+        result = await asyncio.to_thread(request_service.dispatcher.restore_scenario, archive_id, new_name=name)
         return web.json_response(result)
 
     async def list_releases(request: web.Request) -> web.Response:
@@ -158,7 +185,9 @@ def register_scenario_routes(app: web.Application, *, request_service: RequestSe
         )
 
     app.router.add_get("/reef/scenarios", list_scenarios)
+    app.router.add_get("/reef/scenarios/archived", list_archived_scenarios)
     app.router.add_post("/reef/scenarios", create_scenario)
+    app.router.add_post("/reef/scenarios/archives/{archive_id}/restore", restore_scenario)
     app.router.add_post("/reef/scenarios/{scenario}/update", update_scenario)
     app.router.add_delete("/reef/scenarios/{scenario}", delete_scenario)
     app.router.add_get("/reef/scenarios/{scenario}/contract", scenario_contract)

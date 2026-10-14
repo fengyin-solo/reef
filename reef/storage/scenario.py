@@ -8,6 +8,8 @@ implementations may use a database transaction or a recoverable journal.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
+from dataclasses import dataclass
 
 from reef.core.errors import ReefError
 from reef.storage.commits import CommitRecord
@@ -72,6 +74,37 @@ class ScenarioStore(ABC):
         """Release this session's records and other resources exactly once."""
 
 
+@dataclass(frozen=True)
+class StorageArchive:
+    """One archived storage generation, serialized inside a scenario archive manifest.
+
+    ``locations`` are the moved files or URLs an operator can audit. ``token``
+    carries the coordinates :meth:`ScenarioStorage.restore` needs; its keys are
+    implementation-private and its values are plain strings so the manifest is
+    JSON without custom encoders.
+    """
+
+    locations: tuple[str, ...]
+    token: Mapping[str, str]
+
+    def to_dict(self) -> dict[str, object]:
+        return {"locations": list(self.locations), "token": dict(self.token)}
+
+    @classmethod
+    def from_dict(cls, value: object) -> StorageArchive:
+        if not isinstance(value, dict):
+            raise ValueError("storage archive must be an object")
+        raw_locations = value.get("locations")
+        raw_token = value.get("token")
+        if not isinstance(raw_locations, list) or not all(isinstance(item, str) for item in raw_locations):
+            raise ValueError("storage archive locations must be a list of strings")
+        if not isinstance(raw_token, dict) or not all(
+            isinstance(key, str) and isinstance(item, str) for key, item in raw_token.items()
+        ):
+            raise ValueError("storage archive token must be an object of strings")
+        return cls(locations=tuple(raw_locations), token=dict(raw_token))
+
+
 class ScenarioStorage(ABC):
     """Open sessions and maintain their storage without exposing file paths.
 
@@ -90,8 +123,45 @@ class ScenarioStorage(ABC):
         """Open an independently owned session for this scenario."""
 
     @abstractmethod
-    def archive(self, scenario: str) -> tuple[str, ...]:
-        """Archive a closed scenario's state and return archive locations."""
+    def archive(self, scenario: str) -> StorageArchive | None:
+        """Archive a closed scenario's state; ``None`` when nothing is durable.
+
+        The archived generation is never modified or deleted, so a failed
+        restore leaves it usable again.
+        """
+
+    @abstractmethod
+    def restore(
+        self,
+        archive: StorageArchive,
+        *,
+        source: str,
+        target: str,
+        settlement_receipt: str,
+    ) -> tuple[str, ...]:
+        """Copy an archived generation back into active storage.
+
+        Reactivate it under ``target`` (``source`` restores the original name),
+        rewriting scenario identity inside the data when the names differ.
+        Records the archived commit log never consumed are retired from
+        training (compacted, still readable for audit) under
+        ``settlement_receipt`` so restoring a scenario never feeds its old
+        records back into the training queue.
+
+        Raise :class:`reef.core.errors.ArchiveConflict` when ``target`` already
+        has another active generation; the caller's archive stays untouched.
+        Return the active locations the generation now occupies.
+        """
+
+    @abstractmethod
+    def rollback_restore(
+        self,
+        archive: StorageArchive,
+        *,
+        target: str,
+        restored_locations: tuple[str, ...],
+    ) -> None:
+        """Remove the active generation a failed :meth:`restore` placed, leaving the archive intact."""
 
     @abstractmethod
     def prune(self, *, days: float, max_bytes: int) -> int:
@@ -102,4 +172,4 @@ class ScenarioStorage(ABC):
         """Release shared storage resources; repeated closes are harmless."""
 
 
-__all__ = ["ScenarioStorage", "ScenarioStore", "ScenarioStoreConflict"]
+__all__ = ["ScenarioStorage", "ScenarioStore", "ScenarioStoreConflict", "StorageArchive"]

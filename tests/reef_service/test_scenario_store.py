@@ -400,16 +400,17 @@ def test_storage_preserves_paths_archives_and_recreates_without_old_history(tmp_
     assert tmp_path / f"{key}.commits.jsonl" in factory.state_paths("math")
 
     first_archive = factory.archive("math")
-    assert len(first_archive) == 2
-    assert all(Path(location).exists() for location in first_archive)
+    assert first_archive is not None and len(first_archive.locations) == 2
+    assert all(Path(location).exists() for location in first_archive.locations)
     assert (tmp_path / ".locks" / f"{key}.commits.jsonl.lock").exists()
     with closing(factory.open("math")) as session:
         assert session.history() == ()
         assert session.records.count("math") == 0
         session.commit_step(expected_step=0, commit=commit())
     second_archive = factory.archive("math")
-    assert set(first_archive).isdisjoint(second_archive)
-    assert all(Path(location).exists() for location in first_archive)
+    assert second_archive is not None
+    assert set(first_archive.locations).isdisjoint(second_archive.locations)
+    assert all(Path(location).exists() for location in first_archive.locations)
     factory.close()
 
 
@@ -420,10 +421,11 @@ def test_storage_retention_includes_archives_and_preserves_active_records(tmp_pa
         session.records.append(record("active"))
         session.commit_step(expected_step=0, commit=commit())
     archived = factory.archive("math")
+    assert archived is not None
 
     assert factory.prune(days=7.0, max_bytes=1) == 1
 
-    database = next(Path(path) for path in archived if path.endswith(".sqlite3"))
+    database = next(Path(path) for path in archived.locations if path.endswith(".sqlite3"))
     with SQLiteRecordStore(database) as records:
         assert records.get_for_audit("math", "record-1") is None
         assert records.get("math", "active") is not None
@@ -434,7 +436,7 @@ def test_storage_close_preserves_existing_session_and_rejects_new_operations():
     factory = SQLiteScenarioStorage()
     with closing(factory.open("math")) as session:
         assert factory.durable is False
-        assert factory.archive("math") == ()
+        assert factory.archive("math") is None
         assert factory.prune(days=7.0, max_bytes=1) == 0
         factory.close()
         factory.close()

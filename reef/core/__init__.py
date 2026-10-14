@@ -24,12 +24,14 @@ so identity can be shared without pulling in storage, and
 """
 
 from reef.core.artifact_ref import ArtifactRef, LiveWeightArtifactRef, RuntimeLoadSpan, parse_runtime_load_spans
-from reef.core.errors import ReefError, UnknownScenario
+from reef.core.errors import ArchiveConflict, ArchiveCorrupt, ReefError, UnknownArchive, UnknownScenario
 from reef.core.records_types import AgentRecord, RequestType
 from reef.core.reports import ReportBase, ReportValidationError
 
 __all__ = [
     "AgentRecord",
+    "ArchiveConflict",
+    "ArchiveCorrupt",
     "ArtifactRef",
     "LiveWeightArtifactRef",
     "ReefError",
@@ -37,6 +39,7 @@ __all__ = [
     "ReportValidationError",
     "RequestType",
     "RuntimeLoadSpan",
+    "UnknownArchive",
     "UnknownScenario",
     "parse_runtime_load_spans",
 ]

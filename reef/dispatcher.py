@@ -9,19 +9,23 @@ handling lives in ``reef.service``; the dispatcher is transport-free.
 from __future__ import annotations
 
 import logging
+import os
 import shutil
+import socket
 import tempfile
 import time
+import uuid
 from collections.abc import Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Event, Lock, Thread
 from typing import Any
 
-from reef.artifact.artifact import Artifact, ArtifactRef
+from reef.artifact.artifact import Artifact, ArtifactPublicationError, ArtifactRef
 from reef.artifact.memory import InMemoryRepositoryBackend
 from reef.artifact.repository import EnumerableRepositoryBackendFactory, RepositoryBackendFactory
-from reef.core.errors import UnknownScenario
+from reef.core.errors import ArchiveConflict, ReefError, UnknownScenario
 from reef.core.records_types import AgentRecord, RequestType
 from reef.core.reports import ReportValidationError, validate_report_payload
 from reef.core.training_request import TrainingRequest
@@ -36,6 +40,14 @@ from reef.observability import (
 from reef.recipe.base import Recipe
 from reef.recipe.checkpoint_strategy import CheckpointStrategy, EveryNVersions
 from reef.runtime.interfaces import RuntimeContractError, TrainingRuntime
+from reef.scenario.archive import (
+    ArchiveCatalog,
+    ArchivedRecipeDir,
+    ArchivedRelease,
+    ArchiveSourceProcess,
+    ScenarioArchive,
+    utc_stamp,
+)
 from reef.scenario.registry import ScenarioRegistry
 from reef.scenario.scenario import Scenario
 from reef.storage.records import RecordConflict, RecordRetention
@@ -157,6 +169,8 @@ class Dispatcher:
     ) -> None:
         self._recipe = recipe
         self._storage = scenario_storage
+        self._process_id = uuid.uuid4().hex
+        self._archive_catalog = ArchiveCatalog(agent_record_dir)
         self._record_retention_lock = Lock()
         self._experiment_tracker = experiment_tracker if experiment_tracker is not None else NullExperimentTracker()
         self._registry = ScenarioRegistry(
@@ -252,12 +266,22 @@ class Dispatcher:
         ``agent_record_dir/archived``, the recipe's own directories move
         beside themselves, and the repository registration is archived so
         the name is free. Artifacts other scenarios share stay.
+
+        Every move is recorded in an archive manifest carrying the scenario
+        name, deletion time, original release, moved locations, and the source
+        process, so the archive can be listed and restored later.
         """
         if "/" in scenario or scenario in ("", ".", ".."):
             raise UnknownScenario(f"unknown scenario {scenario!r}")
-        with self._record_retention_lock, self._registry.lock_for(scenario):
+        with (
+            self._record_retention_lock,
+            self._archive_catalog.scenario_locks(scenario),
+            self._registry.lock_for(scenario),
+        ):
             if not self._registry.has(scenario):
                 raise UnknownScenario(f"unknown scenario {scenario!r}")
+            release_ref = self._registry.current_release(scenario)
+            release = ArchivedRelease(release_ref.release_id, release_ref.content_id)
             dropped = self._registry.remove(scenario)
             self._stop_local_backend_worker(scenario)
             self._publication.forget(scenario)
@@ -269,21 +293,239 @@ class Dispatcher:
                 if backend is not None:
                     backend.retire_scenario(scenario)
                 dropped.close()
-            archived = [*self._archive_scenario_state(scenario), *self._registry.archive_registration(scenario)]
+            storage_archive = self._registry.archive_store(scenario)
+            model_settings = self._registry.archive_model_settings(scenario)
+            recipe_dirs = self._archive_recipe_state_dirs(scenario)
+            registration_archive = self._registry.archive_registration(scenario)
+            archive_id = self._archive_catalog.new_archive_id()
+            archive = ScenarioArchive(
+                archive_id=archive_id,
+                scenario=scenario,
+                deleted_at=utc_stamp(),
+                deleted_at_epoch=time.time(),
+                source_process=self._source_process(),
+                release=release,
+                storage=storage_archive,
+                registration=registration_archive,
+                model_config=model_settings,
+                recipe_dirs=recipe_dirs,
+            )
+            self._archive_catalog.write(archive)
         self._registry.forget_lock(scenario)
-        return {"scenario": scenario, "archived": archived}
+        return {"scenario": scenario, "archived": list(archive.locations), "archive_id": archive_id}
 
-    def _archive_scenario_state(self, scenario: str) -> list[str]:
-        """Move the scenario's own files and directories under an ``archived`` sibling, stamped so a name can be deleted twice."""
+    def list_archived_scenarios(self) -> tuple[dict[str, Any], ...]:
+        """Summaries of every archived scenario, consumed archives included."""
+        with self._archive_catalog.catalog_lock():
+            return tuple(archive.summary() for archive in self._archive_catalog.list())
+
+    def restore_scenario(self, archive_id: str, *, new_name: str | None = None) -> dict[str, Any]:
+        """Restore a deleted scenario from its archive, under its name or ``new_name``.
+
+        The target name must be free: an existing scenario or a newer stored
+        generation refuses the restore without overwriting anything. The
+        archived records and commit log return to active storage with their
+        historical records retired from training replay, the registration is
+        put back, and the manifest is marked consumed only after the restored
+        scenario resolves. A failure rolls back every placed file and
+        registration while leaving the archive itself usable.
+        """
+        target_name = None if new_name is None else self._validated_scenario_name(new_name)
+        with self._archive_catalog.catalog_lock():
+            manifest = self._archive_catalog.read(archive_id)
+            if manifest.consumed:
+                restored_as = None if manifest.restoration is None else manifest.restoration.restored_as
+                raise ArchiveConflict(f"archive {archive_id} was already restored as {restored_as!r}")
+            source = manifest.scenario
+            target = source if target_name is None else target_name
+            with self._archive_catalog.scenario_locks(source, target):
+                return self._restore_under_locks(archive_id, manifest, source=source, target=target)
+
+    def _restore_under_locks(
+        self,
+        archive_id: str,
+        manifest: ScenarioArchive,
+        *,
+        source: str,
+        target: str,
+    ) -> dict[str, Any]:
+        # lock_for returns the same RLock when the names match, so the pair is one re-entrant hold then.
+        with self._registry.lock_for(source), self._registry.lock_for(target):
+            if self._registry.has(target):
+                raise ArchiveConflict(f"scenario {target!r} already exists; refusing to overwrite it")
+            return self._restore_archive(archive_id, manifest, source=source, target=target)
+
+    def _restore_archive(
+        self,
+        archive_id: str,
+        manifest: ScenarioArchive,
+        *,
+        source: str,
+        target: str,
+    ) -> dict[str, Any]:
+        settlement_receipt = f"reef-archive-restore:{archive_id}"
+        restored_locations: list[str] = []
+        restored_model_settings: list[str] = []
+        restored_recipe_dirs: list[Path] = []
+        registration_restored: str | None = None
+        restored: Scenario | None = None
+        try:
+            if manifest.storage is not None:
+                restored_locations.extend(
+                    self._registry.restore_store(
+                        manifest.storage,
+                        source=source,
+                        target=target,
+                        settlement_receipt=settlement_receipt,
+                    )
+                )
+            restored_model_settings.extend(
+                self._registry.restore_model_settings(archived_path, target=target)
+                for archived_path in manifest.model_config
+            )
+            restored_recipe_dirs = self._restore_recipe_state_dirs(manifest.recipe_dirs, target)
+            registration_restored = self._registry.restore_registration(
+                manifest.registration, source=source, target=target
+            )
+            # A non-durable artifact backend (tests and standalone use) holds no registration across
+            # processes; with the registration absent there is nothing to recover, so fork the same
+            # way the name's first creation did. Durable backends always carry a registration archive.
+            allow_fork = manifest.registration is None
+            restored = self._registry.get_or_create(target, None, allow_implicit_creation=allow_fork)
+            if restored is None:
+                raise ReefError(f"restored scenario {target!r} could not be resolved")
+        except BaseException:
+            self._rollback_restored_archive(
+                manifest,
+                target=target,
+                restored=restored,
+                restored_locations=tuple(restored_locations),
+                restored_model_settings=tuple(restored_model_settings),
+                restored_recipe_dirs=tuple(restored_recipe_dirs),
+                registration_restored=registration_restored is not None,
+            )
+            raise
+        current = restored.repository.require_current_artifact()
+        self._archive_catalog.consume(archive_id, restored_as=target, source_process=self._source_process())
+        try:
+            self._discard_consumed_archive_data(manifest)
+        except (OSError, ArtifactPublicationError):
+            logger.warning("failed to remove all archived data for consumed archive %s", archive_id, exc_info=True)
+        return {
+            "archive_id": archive_id,
+            "scenario": source,
+            "restored_as": target,
+            "release_id": current.release_id,
+            "content_id": current.content_id,
+        }
+
+    def _rollback_restored_archive(
+        self,
+        manifest: ScenarioArchive,
+        *,
+        target: str,
+        restored: Scenario | None,
+        restored_locations: tuple[str, ...],
+        restored_model_settings: tuple[str, ...],
+        restored_recipe_dirs: tuple[Path, ...],
+        registration_restored: bool,
+    ) -> None:
+        """Take a failed restore back apart; archive files were copied from and stay intact."""
+        if restored is not None:
+            dropped = self._registry.remove(target)
+            self._stop_local_backend_worker(target)
+            self._publication.forget(target)
+            self._record_training_error(target, None)
+            with self._training.lock:
+                self._training.failure_counts.pop(target, None)
+            if dropped is not None:
+                backend = dropped.trainer.candidate_backend
+                if backend is not None:
+                    backend.retire_scenario(target)
+                dropped.close()
+        if registration_restored:
+            self._registry.delete_restored_registration(target)
+        if manifest.storage is not None and restored_locations:
+            self._registry.rollback_restored_store(
+                manifest.storage, target=target, restored_locations=restored_locations
+            )
+        for path in restored_model_settings:
+            Path(path).unlink(missing_ok=True)
+        for directory in restored_recipe_dirs:
+            shutil.rmtree(directory, ignore_errors=True)
+
+    def _discard_consumed_archive_data(
+        self,
+        manifest: ScenarioArchive,
+    ) -> None:
+        """Remove the archived copies once consumed; the consumed manifest stays as the audit record."""
+        if manifest.storage is not None:
+            archived_dir = manifest.storage.token.get("archived_dir")
+            if archived_dir:
+                shutil.rmtree(archived_dir, ignore_errors=True)
+            for location in manifest.storage.locations:
+                path = Path(location)
+                if path.is_file():
+                    path.unlink(missing_ok=True)
+                    with suppress(OSError):
+                        path.parent.rmdir()
+        for location in manifest.model_config:
+            path = Path(location)
+            path.unlink(missing_ok=True)
+            with suppress(OSError):
+                path.parent.rmdir()
+        for entry in manifest.recipe_dirs:
+            shutil.rmtree(entry.archived, ignore_errors=True)
+        if manifest.registration is not None:
+            self._registry.discard_archived_registration(manifest.registration)
+
+    def _source_process(self) -> ArchiveSourceProcess:
+        return ArchiveSourceProcess(pid=os.getpid(), host=socket.gethostname(), process_id=self._process_id)
+
+    @staticmethod
+    def _validated_scenario_name(name: str) -> str:
+        if not isinstance(name, str) or not name.strip() or "/" in name or name.strip() in (".", ".."):
+            raise ValueError("restore name must be a non-empty scenario name without path separators")
+        return name.strip()
+
+    def _archive_recipe_state_dirs(self, scenario: str) -> tuple[ArchivedRecipeDir, ...]:
+        """Move the recipe's own per-scenario directories beside themselves, stamped for repeat deletes."""
         stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-        moved = list(self._registry.archive_store(scenario))
+        entries: list[ArchivedRecipeDir] = []
         for directory in self._recipe.scenario_state_dirs(scenario):
             if directory.exists():
                 destination = directory.parent / "archived" / f"{directory.name}-{stamp}"
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(directory), str(destination))
-                moved.append(str(destination))
-        return moved
+                entries.append(
+                    ArchivedRecipeDir(name=directory.name, parent=str(directory.parent), archived=str(destination))
+                )
+        return tuple(entries)
+
+    def _restore_recipe_state_dirs(self, archived_dirs: tuple[ArchivedRecipeDir, ...], target: str) -> list[Path]:
+        """Copy archived recipe directories back to the target scenario's configured locations."""
+        current_dirs = self._recipe.scenario_state_dirs(target)
+        if len(current_dirs) != len(archived_dirs):
+            raise ReefError(
+                f"recipe configuration changed since the archive: {len(archived_dirs)} archived directories "
+                f"but {len(current_dirs)} configured for {target!r}"
+            )
+        restored: list[Path] = []
+        for entry, current in zip(archived_dirs, current_dirs, strict=True):
+            if str(current.parent) != entry.parent:
+                raise ReefError(
+                    f"recipe directory parent for {current.name!r} moved since the archive "
+                    f"({entry.parent!r} -> {str(current.parent)!r})"
+                )
+            archived_path = Path(entry.archived)
+            if not archived_path.is_dir():
+                raise ReefError(f"archived recipe directory is missing: {entry.archived}")
+            if current.exists():
+                raise ArchiveConflict(f"recipe directory already exists for {target!r}: {current}")
+            current.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(archived_path, current)
+            restored.append(current)
+        return restored
 
     def recipe_has_files(self) -> bool:
         """Whether the served recipe creates a file-serving surface."""

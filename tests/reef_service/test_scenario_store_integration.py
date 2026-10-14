@@ -82,10 +82,21 @@ class OpaqueStorage(ScenarioStorage):
         self.sessions.append(store)
         return store
 
-    def archive(self, scenario: str) -> tuple[str, ...]:
+    def archive(self, scenario: str):
         self.events.append(("archive", scenario))
-        self._inner.archive(scenario)
-        return (f"archive://{scenario}",)
+        archived = self._inner.archive(scenario)
+        if archived is None:
+            return None
+        from reef.storage.scenario import StorageArchive
+
+        return StorageArchive(locations=(f"archive://{scenario}",), token=dict(archived.token))
+
+    def restore(self, archive, *, source: str, target: str, settlement_receipt: str):
+        self.events.append(("restore", target))
+        return self._inner.restore(archive, source=source, target=target, settlement_receipt=settlement_receipt)
+
+    def rollback_restore(self, archive, *, target: str, restored_locations: tuple[str, ...]) -> None:
+        self._inner.rollback_restore(archive, target=target, restored_locations=restored_locations)
 
     def prune(self, *, days: float, max_bytes: int) -> int:
         self.prune_calls.append((days, max_bytes))

@@ -35,10 +35,10 @@ from sqlalchemy.engine import URL, Connection, make_url
 from sqlalchemy.exc import ArgumentError
 from sqlalchemy.schema import CreateSchema
 
-from reef.core.errors import ReefError
-from reef.storage.commit_log import CommitLog, CommitLogScenarioStore
+from reef.core.errors import ArchiveConflict, ArchiveCorrupt, ReefError
+from reef.storage.commit_log import CommitLog, CommitLogScenarioStore, rewrite_commit_log_scenario
 from reef.storage.records import RecordRetention
-from reef.storage.scenario import ScenarioStorage
+from reef.storage.scenario import ScenarioStorage, StorageArchive
 from reef.storage.sql_records import RecordTables, SQLRecordRetention, SQLRecordStore
 
 
@@ -216,6 +216,56 @@ class PostgresRecordDatabase:
                 )
             return storage_id
 
+    def restore_store_generation(self, storage_id: str, *, source: str, target: str) -> None:
+        """Reactivate a retired generation under ``target``, refusing a newer generation of the same name."""
+        target_key = hashlib.sha256(target.encode("utf-8")).hexdigest()
+        with self.transaction() as connection:
+            row = (
+                connection.execute(
+                    select(self._stores).where(self._stores.c.storage_id == storage_id).with_for_update()
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if row is None:
+                raise ArchiveCorrupt(f"archived record store generation does not exist: {storage_id}")
+            if row["active_key"] is not None:
+                raise ArchiveConflict(f"archived record store generation {storage_id} is already active")
+            if row["name"] != source:
+                raise ArchiveCorrupt(f"archived record store belongs to {row['name']!r}, not {source!r}")
+            occupant = connection.execute(
+                select(self._stores.c.storage_id).where(self._stores.c.active_key == target_key).with_for_update()
+            ).scalar_one_or_none()
+            if occupant is not None and occupant != storage_id:
+                raise ArchiveConflict(
+                    f"scenario {target!r} already has a newer record store generation; refusing to overwrite it"
+                )
+            connection.execute(
+                self._stores.update()
+                .where(self._stores.c.storage_id == storage_id)
+                .values(active_key=target_key, archived_at=None, name=target)
+            )
+            if target != source:
+                connection.execute(
+                    self.tables.records.update()
+                    .where(self.tables.records.c.storage_id == storage_id)
+                    .values(scenario=target)
+                )
+                connection.execute(
+                    self.tables.compaction_receipts.update()
+                    .where(self.tables.compaction_receipts.c.storage_id == storage_id)
+                    .values(scenario=target)
+                )
+
+    def retire_restored_generation(self, storage_id: str) -> None:
+        """Undo a reactivation when a restore fails afterwards; the rows stay preserved."""
+        with self.transaction() as connection:
+            connection.execute(
+                self._stores.update()
+                .where(self._stores.c.storage_id == storage_id)
+                .values(active_key=None, archived_at=time.time())
+            )
+
     def prune(self, retention: RecordRetention) -> int:
         """Apply age and body-byte limits across active and archived generations."""
         queries = SQLRecordRetention(self.tables)
@@ -333,13 +383,14 @@ class PostgresScenarioStorage(ScenarioStorage):
                 records.close()
                 raise
 
-    def archive(self, scenario: str) -> tuple[str, ...]:
+    def archive(self, scenario: str) -> StorageArchive | None:
         with self._lock:
             self._ensure_open()
             storage_id = self._database.archive(scenario)
             if storage_id is None:
-                return ()
-            archived = [f"postgres://{self._schema}/record-store/{storage_id}"]
+                return None
+            locations = [f"postgres://{self._schema}/record-store/{storage_id}"]
+            archived_log = ""
             # The next generation always gets another log name. If moving the
             # old log fails, reopening cannot apply it to the new empty store.
             path = self._log_path(storage_id)
@@ -348,13 +399,94 @@ class PostgresScenarioStorage(ScenarioStorage):
                 destination.mkdir(parents=True, exist_ok=True)
                 target = destination / path.name
                 shutil.move(str(path), str(target))
-                archived.append(str(target))
-            return tuple(archived)
+                archived_log = str(target)
+                locations.append(archived_log)
+            return StorageArchive(
+                locations=tuple(locations),
+                token={"storage_id": storage_id, "archived_log": archived_log},
+            )
+
+    def restore(
+        self,
+        archive: StorageArchive,
+        *,
+        source: str,
+        target: str,
+        settlement_receipt: str,
+    ) -> tuple[str, ...]:
+        with self._lock:
+            self._ensure_open()
+            storage_id = archive.token.get("storage_id", "")
+            if not storage_id:
+                raise ArchiveCorrupt("archive token is missing the PostgreSQL record store id")
+            self._database.restore_store_generation(storage_id, source=source, target=target)
+            try:
+                records = PostgresRecordStore(self._database, name=target)
+                try:
+                    retired: set[str] = set()
+                    after_sequence = 0
+                    while True:
+                        rows = records.audit_page(target, after_sequence=after_sequence, limit=512)
+                        if not rows:
+                            break
+                        for stored in rows:
+                            if stored.compacted_at is None:
+                                retired.add(stored.item.agent_record_id)
+                        after_sequence = rows[-1].sequence
+                        if len(rows) < 512:
+                            break
+                    if retired:
+                        records.compact(
+                            target,
+                            frozenset(retired),
+                            receipt_id=settlement_receipt,
+                            receipt_metadata={
+                                "kind": "archive-restore",
+                                "source_scenario": source,
+                                "restored_as": target,
+                            },
+                        )
+                finally:
+                    records.close()
+                locations = [f"postgres://{self._schema}/record-store/{storage_id}"]
+                archived_log = archive.token.get("archived_log", "")
+                active_log: Path | None = None
+                if archived_log:
+                    active_log = self._log_path(storage_id)
+                    if active_log.exists():
+                        raise ArchiveConflict(f"commit log already exists for restored store {storage_id}")
+                    if source == target:
+                        shutil.copy2(archived_log, active_log)
+                    else:
+                        rewrite_commit_log_scenario(Path(archived_log), active_log, source=source, target=target)
+                    locations.append(str(active_log))
+            except BaseException:
+                # The generation became reachable through storage only; retire it again so a
+                # failed restore can never expose a half-restored scenario.
+                self._database.retire_restored_generation(storage_id)
+                if active_log is not None:
+                    active_log.unlink(missing_ok=True)
+                raise
+            return tuple(locations)
 
     def prune(self, *, days: float, max_bytes: int) -> int:
         with self._lock:
             self._ensure_open()
             return self._database.prune(RecordRetention(days, max_bytes))
+
+    def rollback_restore(
+        self,
+        archive: StorageArchive,
+        *,
+        target: str,
+        restored_locations: tuple[str, ...],
+    ) -> None:
+        with self._lock:
+            storage_id = archive.token.get("storage_id", "")
+            if storage_id:
+                self._database.retire_restored_generation(storage_id)
+            for location in restored_locations:
+                Path(location).unlink(missing_ok=True)
 
     def close(self) -> None:
         with self._lock:

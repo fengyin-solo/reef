@@ -12,6 +12,7 @@ from __future__ import annotations
 import itertools
 import json
 import os
+import tempfile
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
@@ -21,6 +22,33 @@ from reef.core.errors import ReefError
 from reef.storage.commits import RECORD_KIND, CommitLogError, CommitRecord
 from reef.storage.records import RecordStore
 from reef.storage.scenario import ScenarioStore, ScenarioStoreConflict
+
+
+def rewrite_commit_log_scenario(source_path: Path, destination_path: Path, *, source: str, target: str) -> None:
+    """Copy a JSONL commit log under a new scenario name, validating every record.
+
+    Used when an archived scenario is restored under a different name: the
+    store validates each log record's scenario, so the copied log must carry
+    the new name. The destination is written atomically; the archived source
+    file is never modified.
+    """
+    records = CommitLog(source_path).records()
+    if any(record.scenario != source for record in records):
+        foreign = next(record.scenario for record in records if record.scenario != source)
+        raise CommitLogError(f"archived commit log {source_path} holds records for {foreign!r}, not {source!r}")
+    destination_path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(dir=destination_path.parent, prefix=".commit-log-")
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            for record in records:
+                value = record.to_dict()
+                value["scenario"] = target
+                output.write(json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, destination_path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
 
 
 class CommitLog:
@@ -412,4 +440,11 @@ class CommitLogScenarioStore(ScenarioStore):
         }
 
 
-__all__ = ["RECORD_KIND", "CommitLog", "CommitLogError", "CommitLogScenarioStore", "CommitRecord"]
+__all__ = [
+    "RECORD_KIND",
+    "CommitLog",
+    "CommitLogError",
+    "CommitLogScenarioStore",
+    "CommitRecord",
+    "rewrite_commit_log_scenario",
+]

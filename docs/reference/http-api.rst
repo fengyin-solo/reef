@@ -63,6 +63,11 @@ Routes
 +--------------------------------------------------------+---------------------------------------------------+
 | ``DELETE /reef/scenarios/{scenario}``                  | remove a scenario; its state is archived          |
 +--------------------------------------------------------+---------------------------------------------------+
+| ``GET /reef/scenarios/archived``                       | summaries of archived (and restored) scenarios    |
++--------------------------------------------------------+---------------------------------------------------+
+| ``POST /reef/scenarios/archives/{archive_id}/restore`` | restore an archived scenario under its name or a  |
+|                                                        | given ``name``                                    |
++--------------------------------------------------------+---------------------------------------------------+
 | ``GET /reef/harness``                                  | the served harness tree                           |
 +--------------------------------------------------------+---------------------------------------------------+
 | ``GET /reef/harness/releases``                         | the harness release catalog, oldest first         |
@@ -289,7 +294,16 @@ unknown scenario returns HTTP 404 and you create it first:
 |                                             | required_request_types, training_mode,      |
 |                                             | status}``                                   |
 +---------------------------------------------+---------------------------------------------+
-| ``DELETE /reef/scenarios/{scenario}``       | → ``{scenario, archived}``; 404 unknown     |
+| ``DELETE /reef/scenarios/{scenario}``       | → ``{scenario, archived, archive_id}``;    |
+|                                             | 404 unknown                                 |
++---------------------------------------------+---------------------------------------------+
+| ``GET /reef/scenarios/archived``            | → ``{archives: [...]}``; one summary per    |
+|                                             | archived or restored scenario               |
++---------------------------------------------+---------------------------------------------+
+| ``POST /reef/scenarios/archives/{id}/restore`` | → ``{archive_id, scenario, restored_as,  |
+|                                             | release_id, content_id}``; 400 corrupt     |
+|                                             | manifest or bad name, 404 unknown, 409     |
+|                                             | consumed or occupied target                 |
 +---------------------------------------------+---------------------------------------------+
 
 Deleting a scenario
@@ -305,11 +319,40 @@ base artifact, the shared head and releases other scenarios may fork from
 stay where they are. A step in flight for the scenario ends without a commit.
 Only a local artifact repository can be archived; a remote one answers 501.
 
+The response carries an ``archive_id`` for the auditable manifest written to
+``<agent_record_dir>/archived/manifests/``. The manifest records the scenario
+name, deletion time, the release it served, the process that deleted it, and
+every moved location; ``GET /reef/scenarios/archived`` returns exactly those
+summaries, including consumed archives.
+
 For a scenario that trains weights the deletion is Reef-side: the training
 backend is told to retire the scenario, and the Slime backend does not yet
 act on it, so the scenario's adapter stays resident in the serving engine
 until it is evicted or the training group restarts, and the training job's
 per-scenario history keeps its entry until then.
+
+Listing and restoring archived scenarios
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``GET /reef/scenarios/archived`` lists every archived scenario as a summary:
+``archive_id``, ``scenario``, ``deleted_at``, the served ``release``, the
+``source_process`` (pid, host, process id), the moved ``locations``, and the
+``status`` (``archived`` or ``consumed``) with its restoration record.
+
+``POST /reef/scenarios/archives/{archive_id}/restore`` puts the scenario
+back. With an empty body it restores the original name; ``{"name": "new"}``
+restores it under a different name. The target name must be free: an
+existing scenario or a newer stored generation for that name answers 409
+without overwriting anything, and a consumed archive answers 409 as well.
+The record store, commit log, model settings, recipe directories, and the
+artifact registration are copied back into place (scenario identity inside
+the stored data is rewritten on rename), and the scenario is recovered from
+its commit log. Restored records remain available for audit but are retired
+from training replay, so restoring a scenario never feeds its old records
+back into the training queue. A failed restore rolls back every file and
+registration it placed while leaving the archive usable; on success the
+manifest is marked ``consumed`` and the archived data copies are removed,
+leaving the manifest as the audit record.
 
 Scenario updates
 ~~~~~~~~~~~~~~~~

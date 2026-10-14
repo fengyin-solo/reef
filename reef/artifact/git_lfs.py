@@ -20,8 +20,14 @@ from reef.artifact.artifact import (
     ArtifactSourceError,
 )
 from reef.artifact.git_client import GitClient
-from reef.artifact.repository import CachedRepositoryBackendFactory, StagedReleaseRepositoryBackend
+from reef.artifact.repository import (
+    CachedRepositoryBackendFactory,
+    RegistrationArchive,
+    StagedReleaseRepositoryBackend,
+)
 from reef.artifact.sources import GitVersionSource, download_huggingface_snapshot, parse_artifact_source
+from reef.core.errors import ArchiveConflict, ArchiveCorrupt
+from reef.storage.commits import SCENARIO_METADATA_KEY
 
 _MANIFEST = "reef-artifact.json"
 _LFS_PATTERNS = ("*.safetensors", "*.bin", "*.pt", "*.pth", "*.ckpt")
@@ -580,7 +586,7 @@ class _GitLFSRepositoryBackendFactory(CachedRepositoryBackendFactory):
         )
         return bool(output)
 
-    def _archive_persisted_registration(self, scenario: str) -> tuple[str, ...]:
+    def _archive_persisted_registration(self, scenario: str) -> RegistrationArchive | None:
         """Rename the scenario's ref into ``refs/reef/archived/<scenario>/<time>`` and drop its work clone.
 
         The commits stay reachable under the archived ref, so nothing the
@@ -591,7 +597,8 @@ class _GitLFSRepositoryBackendFactory(CachedRepositoryBackendFactory):
         if not isinstance(self._repository, Path):
             raise NotImplementedError("archiving a scenario needs a local artifact repository")
         encoded = base64.urlsafe_b64encode(scenario.encode()).decode().rstrip("=")
-        archived: list[str] = []
+        locations: list[str] = []
+        token: dict[str, str] = {}
         ref_name = f"refs/reef/scenarios/{encoded}"
         if self._repository.exists():
             client = GitClient(self._work_dir / ".registration-check")
@@ -602,12 +609,112 @@ class _GitLFSRepositoryBackendFactory(CachedRepositoryBackendFactory):
                 archived_ref = f"refs/reef/archived/{encoded}/{stamp}"
                 client.run((*git_dir, "update-ref", archived_ref, sha), source_error=True)
                 client.run((*git_dir, "update-ref", "-d", ref_name, sha), source_error=True)
-                archived.append(archived_ref)
+                locations.append(archived_ref)
+                token["archived_ref"] = archived_ref
         work_dir = self._work_dir / encoded
         if work_dir.exists():
             shutil.rmtree(work_dir, ignore_errors=True)
-            archived.append(str(work_dir))
-        return tuple(archived)
+            locations.append(str(work_dir))
+        return RegistrationArchive(locations=tuple(locations), token=token) if token else None
+
+    def _restore_persisted_registration(
+        self,
+        archive: RegistrationArchive,
+        *,
+        source: str,
+        target: str,
+    ) -> str:
+        """Point the scenario ref back at the archived commit, rewriting its metadata on rename.
+
+        Same-name restore is a single ``update-ref``. A different name needs a
+        new commit whose manifest metadata names the new scenario; its parent
+        is the archived commit, so the whole release chain stays reachable.
+        The target ref must not exist, and the archived ref is deleted only
+        after the new one is in place.
+        """
+        if not isinstance(self._repository, Path):
+            raise NotImplementedError("restoring a scenario needs a local artifact repository")
+        archived_ref = archive.token.get("archived_ref", "")
+        source_encoded = base64.urlsafe_b64encode(source.encode()).decode().rstrip("=")
+        target_encoded = base64.urlsafe_b64encode(target.encode()).decode().rstrip("=")
+        target_ref = f"refs/reef/scenarios/{target_encoded}"
+        client = GitClient(self._work_dir / ".registration-check")
+        git_dir = ("git", "--git-dir", str(self._repository))
+        sha = client.run((*git_dir, "rev-parse", "--verify", "--quiet", archived_ref), source_error=True).strip()
+        if not sha:
+            raise ArchiveCorrupt(f"archived registration ref is missing: {archived_ref or '<unset>'}")
+        if client.run(("git", "ls-remote", str(self._repository), target_ref), source_error=True).strip():
+            raise ArchiveConflict(f"artifact registration already exists for scenario {target!r}")
+        if target == source:
+            client.run((*git_dir, "update-ref", target_ref, sha), source_error=True)
+            restored_ref = target_ref
+        else:
+            restored_ref = self._commit_renamed_registration(sha, archived_ref, target_ref, target)
+        for encoded in (source_encoded, target_encoded):
+            shutil.rmtree(self._work_dir / encoded, ignore_errors=True)
+        return restored_ref
+
+    def _discard_archived_persisted_registration(self, archive: RegistrationArchive) -> None:
+        """Delete the archived pointer after a confirmed restore; the restored ref keeps the commits reachable."""
+        if not isinstance(self._repository, Path) or not self._repository.exists():
+            return
+        archived_ref = archive.token.get("archived_ref", "")
+        if not archived_ref:
+            return
+        client = GitClient(self._work_dir / ".registration-check")
+        git_dir = ("git", "--git-dir", str(self._repository))
+        sha = client.run((*git_dir, "rev-parse", "--verify", "--quiet", archived_ref), source_error=True).strip()
+        if sha:
+            client.run((*git_dir, "update-ref", "-d", archived_ref, sha), source_error=True)
+
+    def _delete_persisted_registration(self, scenario: str) -> None:
+        """Drop a scenario ref during a restore rollback; its release commits stay in the repository."""
+        if not isinstance(self._repository, Path) or not self._repository.exists():
+            return
+        encoded = base64.urlsafe_b64encode(scenario.encode()).decode().rstrip("=")
+        ref_name = f"refs/reef/scenarios/{encoded}"
+        client = GitClient(self._work_dir / ".registration-check")
+        git_dir = ("git", "--git-dir", str(self._repository))
+        sha = client.run((*git_dir, "rev-parse", "--verify", "--quiet", ref_name), source_error=True).strip()
+        if sha:
+            client.run((*git_dir, "update-ref", "-d", ref_name, sha), source_error=True)
+        shutil.rmtree(self._work_dir / encoded, ignore_errors=True)
+
+    def _commit_renamed_registration(self, sha: str, archived_ref: str, target_ref: str, target: str) -> str:
+        """Create a metadata-rewritten child commit of the archived ref and publish it as ``target_ref``.
+
+        Tree plumbing keeps the artifact bytes untouched: the index takes the
+        archived commit's whole tree and only the manifest entry is replaced.
+        """
+        restore_dir = self._work_dir / f".restore-{uuid.uuid4().hex}"
+        try:
+            clone_dir = restore_dir / "clone"
+            client = GitClient(clone_dir)
+            client.run(("git", "clone", "--no-checkout", str(self._repository), str(clone_dir)))
+            client.git("config", "user.name", "Reef Repository Backend")
+            client.git("config", "user.email", "reef-artifacts@localhost")
+            client.git("fetch", "origin", archived_ref)
+            # commit-tree is plumbing and wants an object id, not a symbolic revision like FETCH_HEAD.
+            head_sha = client.git("rev-parse", "FETCH_HEAD").strip()
+            client.git("read-tree", head_sha)
+            client.git("checkout", head_sha, "--", _MANIFEST)
+            manifest_path = clone_dir / _MANIFEST
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            metadata = manifest.get("metadata")
+            if not isinstance(metadata, dict) or not isinstance(metadata.get(SCENARIO_METADATA_KEY), dict):
+                raise ArchiveCorrupt(f"archived registration at {sha} carries no scenario metadata")
+            registration = dict(metadata[SCENARIO_METADATA_KEY])
+            registration["scenario"] = target
+            metadata[SCENARIO_METADATA_KEY] = registration
+            manifest["metadata"] = metadata
+            manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            client.git("add", _MANIFEST)
+            tree = client.git("write-tree").strip()
+            commit = client.git("commit-tree", tree, "-p", head_sha, "-m", f"restore scenario as {target}").strip()
+            client.git("push", "origin", f"{commit}:{target_ref}")
+            return target_ref
+        finally:
+            shutil.rmtree(restore_dir, ignore_errors=True)
 
     def _list_persisted_registrations(self) -> tuple[str, ...]:
         if isinstance(self._repository, Path) and not self._repository.exists():

@@ -254,7 +254,7 @@ def test_factory_commit_recovery_and_archive(postgres_config, tmp_path, monkeypa
             assert store.records.count("math") == 0
             assert store.records.append_result(record()).inserted is False
         archived = factory.archive("math")
-        assert archived[0].startswith("postgres://")
+        assert archived is not None and archived.locations[0].startswith("postgres://")
         with closing(factory.open("math")) as store:
             assert store.history() == ()
             assert store.records.append_result(record()).inserted
