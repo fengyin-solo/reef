@@ -11,7 +11,7 @@ from reef.runtime.interfaces import InferenceHandler
 from reef.service.auth import create_authentication_middleware
 from reef.service.cors import configure_browser_access
 from reef.service.errors import translate_errors
-from reef.service.request_service import InferenceRetryPolicy, RequestService
+from reef.service.request_service import InferenceRetryPolicy, RequestService, StreamTimeLimits
 from reef.service.routes import register_routes
 from reef.storage.records import RecordRetention
 
@@ -40,11 +40,16 @@ def create_app(
     console_origins: Iterable[str] = (),
     inference_handler: InferenceHandler | None = None,
     inference_retry_policy: InferenceRetryPolicy | None = None,
+    stream_time_limits: StreamTimeLimits | None = None,
     close_dispatcher: bool = False,
     record_retention: RecordRetention | None = None,
 ) -> web.Application:
     """Build the HTTP app around an existing dispatcher; close it only when requested."""
-    request_service = RequestService(dispatcher, retry_policy=inference_retry_policy)
+    request_service = RequestService(
+        dispatcher,
+        retry_policy=inference_retry_policy,
+        stream_time_limits=stream_time_limits,
+    )
     request_service_key = web.AppKey("reef_request_service", RequestService)
     app = web.Application(middlewares=[create_authentication_middleware(tokens), translate_errors])
     configure_browser_access(app, console_origins)
@@ -79,5 +84,6 @@ def create_app(
 __all__ = [
     "InferenceRetryPolicy",
     "RequestService",
+    "StreamTimeLimits",
     "create_app",
 ]

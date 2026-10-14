@@ -576,6 +576,8 @@ shown above; the repository examples all use version 2.
    reef.upstream_api | openai | the provider dialect: ``openai`` for Chat Completions, ``responses`` for OpenAI Responses, or ``anthropic`` for an Anthropic-style endpoint
    reef.inference_url | the address the training backend reports | the local engine; set only to front the engines with something else
    reef.inference_timeout_s | 300.0 | per-request timeout
+   reef.inference_stream_timeout_s | 300.0 | overall duration cap for one streamed inference; defaults to reef.inference_timeout_s. A stream past the cap has its upstream connection closed and is recorded incomplete as a timeout
+   reef.inference_stream_idle_timeout_s | 60.0 | max silence between two adjacent streamed chunks. A stream whose upstream stops producing past the gap is closed and recorded as a timeout; client disconnects are cancelled the same way
    reef.allow_implicit_scenario_creation | true | when false, an unknown scenario is HTTP 404
    reef.checkpoint_every_n_versions | 1 | how often a version becomes durable
 
@@ -1076,6 +1078,13 @@ The following names are relative to ``operations/``:
    * - ``serve/retries_total``, ``serve/timeouts_total``
      - Additional buffered inference attempts and requests that exhaust the
        inference retry deadline. Retries do not create extra request counts.
+   * - ``serve/stream_timeouts_total``, ``serve/stream_idle_timeouts_total``,
+       ``serve/stream_client_disconnects_total``,
+       ``serve/stream_upstream_errors_total``
+     - Streamed inferences that ended before their terminal event: the overall
+       duration cap, the idle gap between chunks, a client disconnect, or an
+       upstream failure, respectively. Each is recorded as a delivery
+       diagnostic only and never enters training reads.
    * - ``serve/version_mismatch_total``
      - Responses rejected by runtime-load-ID verification, including missing
        engine version information and buffered or deferred streaming responses.

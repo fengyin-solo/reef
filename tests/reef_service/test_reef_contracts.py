@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from contextlib import closing
 from dataclasses import dataclass
@@ -18,13 +19,13 @@ from reef.artifact import (
 )
 from reef.core import ReefError, RequestType
 from reef.dispatcher import Dispatcher, build_default_dispatcher
-from reef.inference.http import HttpInferenceHandler, content_identity_headers
+from reef.inference.http import HttpInferenceHandler, InferenceProxyRuntime, content_identity_headers
 from reef.recipe import Recipe
 from reef.recipe.checkpoint_strategy import EveryNVersions
 from reef.runtime.interfaces import InferenceHandler
-from reef.service.app import InferenceRetryPolicy, RequestService, create_app
+from reef.service.app import InferenceRetryPolicy, RequestService, StreamTimeLimits, create_app
 from reef.storage.sqlite import SQLiteScenarioStorage
-from reef.surface import Surface, create_weight_surface
+from reef.surface import InferenceLease, LeasingInferenceHooks, Surface, create_weight_surface
 from reef.train import TrainStepResult
 from reef.train.types import TrainingBatch
 
@@ -650,6 +651,398 @@ def test_sse_without_terminal_event_has_no_receipt_and_is_recorded_incomplete(tm
             await upstream_server.close()
 
     import asyncio
+
+    asyncio.run(run())
+
+
+async def _start_stream_stack(tmp_path, upstream_handler, *, stream_limits, dispatcher=None):
+    """A stalling upstream and a Reef app relaying it with the given stream bounds."""
+    from aiohttp import web
+
+    upstream_app = web.Application()
+    upstream_app.router.add_post("/v1/chat/completions", upstream_handler)
+    upstream_server = TestServer(upstream_app)
+    await upstream_server.start_server()
+    if dispatcher is None:
+        dispatcher = build_default_dispatcher(
+            local_artifact_dir=tmp_path / "local", scenario_storage=SQLiteScenarioStorage()
+        )
+    handler = HttpInferenceHandler(str(upstream_server.make_url("")).rstrip("/"))
+    client = TestClient(
+        TestServer(create_app(dispatcher, inference_handler=handler, stream_time_limits=stream_limits))
+    )
+    await client.start_server()
+    return upstream_server, dispatcher, client
+
+
+async def _wait_for_stream_record(dispatcher, *, scenario="chat", timeout_s=3.0):
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_s
+    while loop.time() < deadline:
+        records = dispatcher.get_or_create_scenario(scenario).records.replay(scenario)
+        if records:
+            return records[0]
+        await asyncio.sleep(0.02)
+    raise AssertionError("the stream record was not stored")
+
+
+def _stream_chat_payload():
+    return {"messages": [{"role": "user", "content": "hi"}], "stream": True}
+
+
+@pytest.mark.unit
+def test_stream_idle_timeout_closes_upstream_and_is_recorded_as_timeout(tmp_path) -> None:
+    async def run() -> None:
+        from aiohttp import web
+
+        first_chunk = b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'
+        upstream_closed = asyncio.Event()
+
+        async def upstream(request):
+            response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+            await response.prepare(request)
+            await response.write(first_chunk)
+            try:
+                await asyncio.Event().wait()
+            finally:
+                upstream_closed.set()
+
+        upstream_server, dispatcher, client = await _start_stream_stack(
+            tmp_path,
+            upstream,
+            stream_limits=StreamTimeLimits(total_timeout_s=5, idle_timeout_s=0.1),
+        )
+        try:
+            response = await client.post(
+                "/v1/chat/completions",
+                headers={"x-reef-scenario": "chat"},
+                json=_stream_chat_payload(),
+            )
+            assert await response.content.readexactly(len(first_chunk)) == first_chunk
+            # The relay stops at the idle bound and ends the response itself.
+            assert await asyncio.wait_for(response.content.read(), timeout=3) == b""
+            # It did not wait for the upstream: the provider connection was aborted.
+            await asyncio.wait_for(upstream_closed.wait(), timeout=3)
+
+            [record] = dispatcher.get_or_create_scenario("chat").records.replay("chat")
+            assert record.payload["response"]["complete"] is False
+            assert record.payload["response"]["error"].startswith("stream idle timeout")
+            assert record.payload["response"]["body"] == first_chunk.decode()
+            metrics = dispatcher.get_or_create_scenario("chat").operations.snapshot()
+            assert metrics["serve/stream_idle_timeouts_total"] == 1
+            assert metrics["serve/stream_timeouts_total"] == 0
+            assert metrics["serve/stream_client_disconnects_total"] == 0
+            assert metrics["serve/stream_upstream_errors_total"] == 0
+            assert metrics["serve/request/failed_total"] == 1
+            assert metrics["serve/request/active"] == 0
+        finally:
+            await client.close()
+            await upstream_server.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.unit
+def test_stream_total_timeout_closes_a_trickling_upstream(tmp_path) -> None:
+    async def run() -> None:
+        from aiohttp import web
+
+        chunk = b'data: {"choices":[{"delta":{"content":"."}}]}\n\n'
+        upstream_closed = asyncio.Event()
+        chunks_sent = 0
+
+        async def upstream(request):
+            nonlocal chunks_sent
+            response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+            await response.prepare(request)
+            try:
+                while True:
+                    await asyncio.sleep(0.02)
+                    await response.write(chunk)
+                    chunks_sent += 1
+            finally:
+                upstream_closed.set()
+
+        upstream_server, dispatcher, client = await _start_stream_stack(
+            tmp_path,
+            upstream,
+            stream_limits=StreamTimeLimits(total_timeout_s=0.2, idle_timeout_s=5),
+        )
+        try:
+            response = await client.post(
+                "/v1/chat/completions",
+                headers={"x-reef-scenario": "chat"},
+                json=_stream_chat_payload(),
+            )
+            body = await asyncio.wait_for(response.read(), timeout=3)
+            assert b"[DONE]" not in body
+            await asyncio.wait_for(upstream_closed.wait(), timeout=3)
+            assert chunks_sent >= 2
+
+            record = await _wait_for_stream_record(dispatcher)
+            assert record.payload["response"]["complete"] is False
+            assert record.payload["response"]["error"].startswith("stream timeout exceeded")
+            metrics = dispatcher.get_or_create_scenario("chat").operations.snapshot()
+            assert metrics["serve/stream_timeouts_total"] == 1
+            assert metrics["serve/stream_idle_timeouts_total"] == 0
+            assert metrics["serve/stream_client_disconnects_total"] == 0
+            assert metrics["serve/stream_upstream_errors_total"] == 0
+            assert metrics["serve/request/failed_total"] == 1
+            assert metrics["serve/request/active"] == 0
+        finally:
+            await client.close()
+            await upstream_server.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.unit
+def test_client_disconnect_cancels_upstream_and_is_recorded_incomplete(tmp_path) -> None:
+    async def run() -> None:
+        from aiohttp import web
+
+        first_chunk = b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'
+        upstream_closed = asyncio.Event()
+
+        async def upstream(request):
+            response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+            await response.prepare(request)
+            await response.write(first_chunk)
+            try:
+                await asyncio.Event().wait()
+            finally:
+                upstream_closed.set()
+
+        upstream_server, dispatcher, client = await _start_stream_stack(
+            tmp_path,
+            upstream,
+            stream_limits=StreamTimeLimits(total_timeout_s=5, idle_timeout_s=5),
+        )
+        try:
+            response = await client.post(
+                "/v1/chat/completions",
+                headers={"x-reef-scenario": "chat"},
+                json=_stream_chat_payload(),
+            )
+            assert await response.content.readexactly(len(first_chunk)) == first_chunk
+            # The client leaves while the upstream is still generating.
+            response.close()
+            await asyncio.wait_for(upstream_closed.wait(), timeout=3)
+
+            record = await _wait_for_stream_record(dispatcher)
+            assert record.payload["response"]["complete"] is False
+            assert record.payload["response"]["error"] == "client disconnected"
+            assert record.payload["response"]["body"] == first_chunk.decode()
+            metrics = dispatcher.get_or_create_scenario("chat").operations.snapshot()
+            assert metrics["serve/stream_client_disconnects_total"] == 1
+            assert metrics["serve/stream_timeouts_total"] == 0
+            assert metrics["serve/stream_idle_timeouts_total"] == 0
+            assert metrics["serve/stream_upstream_errors_total"] == 0
+            assert metrics["serve/request/active"] == 0
+        finally:
+            await client.close()
+            await upstream_server.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.unit
+def test_upstream_stream_failure_is_recorded_as_upstream_error(tmp_path) -> None:
+    async def run() -> None:
+        import aiohttp
+        from aiohttp import web
+
+        first_chunk = b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'
+
+        async def upstream(request):
+            response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+            await response.prepare(request)
+            await response.write(first_chunk)
+            raise RuntimeError("engine exploded")
+
+        upstream_server, dispatcher, client = await _start_stream_stack(
+            tmp_path,
+            upstream,
+            stream_limits=StreamTimeLimits(total_timeout_s=5, idle_timeout_s=5),
+        )
+        try:
+            response = await client.post(
+                "/v1/chat/completions",
+                headers={"x-reef-scenario": "chat"},
+                json=_stream_chat_payload(),
+            )
+            received = bytearray()
+            try:
+                while True:
+                    chunk = await asyncio.wait_for(response.content.readany(), timeout=3)
+                    if not chunk:
+                        break
+                    received.extend(chunk)
+            except (aiohttp.ClientPayloadError, aiohttp.ServerDisconnectedError):
+                pass
+            # The upstream fails after its first write; the client may or may
+            # not see that partial frame before the connection drops.
+            assert bytes(received) in (b"", first_chunk) or first_chunk in received
+
+            record = await _wait_for_stream_record(dispatcher)
+            assert record.payload["response"]["complete"] is False
+            assert record.payload["response"]["error"]
+            metrics = dispatcher.get_or_create_scenario("chat").operations.snapshot()
+            assert metrics["serve/stream_upstream_errors_total"] == 1
+            assert metrics["serve/stream_timeouts_total"] == 0
+            assert metrics["serve/stream_idle_timeouts_total"] == 0
+            assert metrics["serve/stream_client_disconnects_total"] == 0
+            assert metrics["serve/request/failed_total"] == 1
+        finally:
+            await client.close()
+            await upstream_server.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.unit
+def test_completed_stream_under_limits_records_no_delivery_failure_metrics(tmp_path) -> None:
+    async def run() -> None:
+        from aiohttp import web
+
+        chunk = b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'
+        terminal = b"data: [DONE]\n\n"
+
+        async def upstream(request):
+            response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+            await response.prepare(request)
+            await response.write(chunk)
+            await response.write(terminal)
+            return response
+
+        upstream_server, dispatcher, client = await _start_stream_stack(
+            tmp_path,
+            upstream,
+            stream_limits=StreamTimeLimits(total_timeout_s=5, idle_timeout_s=2),
+        )
+        try:
+            response = await client.post(
+                "/v1/chat/completions",
+                headers={"x-reef-scenario": "chat"},
+                json=_stream_chat_payload(),
+            )
+            body = await asyncio.wait_for(response.read(), timeout=3)
+            assert body.endswith(terminal)
+            [record] = dispatcher.get_or_create_scenario("chat").records.replay("chat")
+            assert record.payload["response"]["complete"] is True
+            metrics = dispatcher.get_or_create_scenario("chat").operations.snapshot()
+            assert metrics["serve/stream_timeouts_total"] == 0
+            assert metrics["serve/stream_idle_timeouts_total"] == 0
+            assert metrics["serve/stream_client_disconnects_total"] == 0
+            assert metrics["serve/stream_upstream_errors_total"] == 0
+            assert metrics["serve/request/completed_total"] == 1
+            assert metrics["serve/request/failed_total"] == 0
+        finally:
+            await client.close()
+            await upstream_server.close()
+
+    asyncio.run(run())
+
+
+class _RecordingLease(InferenceLease):
+    """An adapter lease that counts how many are still held."""
+
+    def __init__(self, state: dict[str, int]) -> None:
+        self._state = state
+
+    def release(self) -> None:
+        self._state["leases"] -= 1
+
+
+class _LeaseTrackingHooks(LeasingInferenceHooks):
+    def __init__(self, state: dict[str, int]) -> None:
+        self._state = state
+
+    def prepare_request(self, artifact: Artifact, path: str, request: dict) -> dict:
+        return request
+
+    def verify_response(self, artifact: Artifact, path: str, response: dict) -> None:
+        return None
+
+    def begin_request(self, artifact: Artifact, path: str) -> InferenceLease:
+        self._state["leases"] += 1
+        return _RecordingLease(self._state)
+
+
+def _leasing_dispatcher(tmp_path, runtime, hooks):
+    initial = tmp_path / "initial"
+    initial.mkdir()
+    (initial / "model.txt").write_text("base")
+
+    class LeasingRecipe(Recipe):
+        def build_surface(self, scenario: str) -> Surface:
+            return Surface(inference=hooks)
+
+    return Dispatcher(
+        LeasingRecipe(runtime=runtime),
+        InMemoryRepositoryBackend.factory(initial, root=tmp_path / "repository"),
+        local_artifact_dir=tmp_path / "local",
+        scenario_storage=SQLiteScenarioStorage(),
+    )
+
+
+@pytest.mark.unit
+def test_stream_timeout_releases_admission_slot_and_adapter_lease(tmp_path) -> None:
+    async def run() -> None:
+        from aiohttp import web
+
+        first_chunk = b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'
+        upstream_closed = asyncio.Event()
+        lease_state = {"leases": 0}
+        runtime = InferenceProxyRuntime(base_url="http://upstream-unused")
+        hooks = _LeaseTrackingHooks(lease_state)
+        dispatcher = _leasing_dispatcher(tmp_path, runtime, hooks)
+
+        async def upstream(request):
+            response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+            await response.prepare(request)
+            await response.write(first_chunk)
+            try:
+                await asyncio.Event().wait()
+            finally:
+                upstream_closed.set()
+
+        upstream_server, dispatcher, client = await _start_stream_stack(
+            tmp_path,
+            upstream,
+            stream_limits=StreamTimeLimits(total_timeout_s=5, idle_timeout_s=0.1),
+            dispatcher=dispatcher,
+        )
+        try:
+            response = await client.post(
+                "/v1/chat/completions",
+                headers={"x-reef-scenario": "chat"},
+                json=_stream_chat_payload(),
+            )
+            assert await response.content.readexactly(len(first_chunk)) == first_chunk
+            # While stalled, the request still holds its admission slot and adapter lease.
+            assert runtime.inference_admission_status == {"open": True, "active": 1}
+            assert lease_state["leases"] == 1
+
+            assert await asyncio.wait_for(response.content.read(), timeout=3) == b""
+            await asyncio.wait_for(upstream_closed.wait(), timeout=3)
+            # Both are released at the current transcription point, not at natural upstream end.
+            assert runtime.inference_admission_status == {"open": True, "active": 0}
+            assert lease_state["leases"] == 0
+
+            record = await _wait_for_stream_record(dispatcher)
+            recorded_response = record.payload["response"]
+            assert recorded_response["complete"] is False
+            assert recorded_response["error"].startswith("stream idle timeout")
+            assert recorded_response["body"] == first_chunk.decode()
+            # The diagnostic carries no trainable response block.
+            assert "message" not in recorded_response
+            assert "training" not in recorded_response
+            metrics = dispatcher.get_or_create_scenario("chat").operations.snapshot()
+            assert metrics["serve/stream_idle_timeouts_total"] == 1
+        finally:
+            await client.close()
+            await upstream_server.close()
 
     asyncio.run(run())
 

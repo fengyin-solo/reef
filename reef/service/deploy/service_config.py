@@ -133,6 +133,16 @@ class ServiceConfig:
         public_path=("inference", "retry_timeout_s"),
         help="Retry deadline in seconds; defaults to the inference timeout.",
     )
+    inference_stream_timeout_s: float = config_option(
+        300.0,
+        public_path=("inference", "stream_timeout_s"),
+        help="Overall duration cap in seconds for one streamed inference; defaults to the inference timeout.",
+    )
+    inference_stream_idle_timeout_s: float = config_option(
+        60.0,
+        public_path=("inference", "stream_idle_timeout_s"),
+        help="Max seconds between two adjacent streamed chunks before the upstream is closed.",
+    )
     artifact_repository: str = config_option(
         ".reef/artifacts.git", public_path=("storage", "artifact_repository"), help="Artifact repository location."
     )
@@ -385,6 +395,9 @@ def service_config_from_mapping(config: Mapping[str, Any]) -> ServiceConfig:
     # The legacy retry deadline follows the request timeout unless supplied.
     if _config_service_value(config, "reef", "inference_retry_timeout_s") is None:
         values["inference_retry_timeout_s"] = values["inference_timeout_s"]
+    # The overall stream duration cap likewise follows the request timeout.
+    if _config_service_value(config, "reef", "inference_stream_timeout_s") is None:
+        values["inference_stream_timeout_s"] = values["inference_timeout_s"]
     # Preserve shared execution settings for presets and directly selected recipes.
     preset = dict(config) if "implementation" in config or ":" in values["recipe"] else None
     return ServiceConfig(**values, recipe_settings=_reef_section(config), preset_config=preset)

@@ -14,7 +14,7 @@ import logging
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import Any, Literal
 
 from reef.artifact.artifact import Artifact, ArtifactError, ArtifactNotFound, ArtifactRef
 from reef.core.errors import ReefError, UnknownScenario
@@ -142,18 +142,63 @@ class InferenceRetryPolicy:
             raise ValueError("inference retry policy requires 0 < initial_s <= max_s and timeout_s > 0")
 
 
+@dataclass(frozen=True)
+class StreamTimeLimits:
+    """Time bounds enforced while one streamed inference is relayed.
+
+    ``total_timeout_s`` caps the stream's whole lifetime; ``idle_timeout_s``
+    caps the silence between two adjacent upstream chunks, so an upstream that
+    connects and then stalls is aborted instead of holding the request open.
+    """
+
+    total_timeout_s: float = 300.0
+    idle_timeout_s: float = 60.0
+
+    def __post_init__(self) -> None:
+        if self.total_timeout_s <= 0 or self.idle_timeout_s <= 0:
+            raise ValueError("stream time limits require positive total_timeout_s and idle_timeout_s")
+
+
+#: Why a streamed inference ended before its terminal event. Each value maps to
+#: one delivery metric so timeouts, client disconnects and upstream failures
+#: stay distinguishable.
+STREAM_END_IDLE_TIMEOUT: Literal["idle_timeout"] = "idle_timeout"
+STREAM_END_TOTAL_TIMEOUT: Literal["total_timeout"] = "total_timeout"
+STREAM_END_CLIENT_DISCONNECTED: Literal["client_disconnected"] = "client_disconnected"
+STREAM_END_UPSTREAM_ERROR: Literal["upstream_error"] = "upstream_error"
+StreamEndReason = Literal["idle_timeout", "total_timeout", "client_disconnected", "upstream_error"]
+
+_STREAM_END_COUNTERS: Mapping[StreamEndReason, str] = {
+    STREAM_END_IDLE_TIMEOUT: "serve/stream_idle_timeouts_total",
+    STREAM_END_TOTAL_TIMEOUT: "serve/stream_timeouts_total",
+    STREAM_END_CLIENT_DISCONNECTED: "serve/stream_client_disconnects_total",
+    STREAM_END_UPSTREAM_ERROR: "serve/stream_upstream_errors_total",
+}
+
+
 class InferenceRetryTimeout(ReefError):
     """Inference attempts ending with a handler ``abort`` exhausted their retry deadline."""
 
 
 class RequestService:
-    def __init__(self, dispatcher: Dispatcher, *, retry_policy: InferenceRetryPolicy | None = None) -> None:
+    def __init__(
+        self,
+        dispatcher: Dispatcher,
+        *,
+        retry_policy: InferenceRetryPolicy | None = None,
+        stream_time_limits: StreamTimeLimits | None = None,
+    ) -> None:
         self._dispatcher = dispatcher
         self._retry_policy = retry_policy or InferenceRetryPolicy()
+        self._stream_time_limits = stream_time_limits or StreamTimeLimits()
 
     @property
     def dispatcher(self) -> Dispatcher:
         return self._dispatcher
+
+    @property
+    def stream_time_limits(self) -> StreamTimeLimits:
+        return self._stream_time_limits
 
     def accept(
         self,
@@ -349,7 +394,15 @@ class RequestService:
             raise NotImplementedError(f"the served recipe relays no multimodal calls, so it serves no {path}")
         return await relay.relay(path, payload)
 
-    def record_stream(self, pending: PendingInference, response: Mapping[str, Any]) -> AgentRecord:
+    def record_stream(
+        self,
+        pending: PendingInference,
+        response: Mapping[str, Any],
+        *,
+        end_reason: StreamEndReason | None = None,
+    ) -> AgentRecord:
+        if end_reason is not None and end_reason not in _STREAM_END_COUNTERS:
+            raise ValueError(f"unknown stream end reason {end_reason!r}")
         succeeded = False
         try:
             payload = dict(pending.item.payload)
@@ -393,6 +446,8 @@ class RequestService:
             raise
         finally:
             if pending.measurement is not None:
+                if end_reason is not None:
+                    pending.measurement.metrics.increment(_STREAM_END_COUNTERS[end_reason])
                 pending.measurement.finish(succeeded=succeeded)
             try:
                 if pending.lease is not None:
@@ -956,11 +1011,17 @@ def client_inference_response(response: Mapping[str, Any]) -> dict[str, Any]:
 
 
 __all__ = [
+    "STREAM_END_CLIENT_DISCONNECTED",
+    "STREAM_END_IDLE_TIMEOUT",
+    "STREAM_END_TOTAL_TIMEOUT",
+    "STREAM_END_UPSTREAM_ERROR",
     "InferenceRetryPolicy",
     "InferenceRetryTimeout",
     "PendingInference",
     "PreparedInference",
     "RequestService",
+    "StreamEndReason",
+    "StreamTimeLimits",
     "client_inference_response",
     "normalize_request_payload",
     "page_headers",

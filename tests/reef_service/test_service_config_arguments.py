@@ -172,6 +172,29 @@ def test_retry_deadline_still_follows_inference_timeout():
     assert service_config_from_mapping(config).inference_retry_timeout_s == 12
 
 
+def test_stream_timeout_follows_inference_timeout_and_idle_is_separate():
+    config = {"reef": {"recipe": "recipe", "inference_timeout_s": 42}}
+    settings = service_config_from_mapping(normalize_service_config(config))
+    assert settings.inference_stream_timeout_s == 42
+    assert settings.inference_stream_idle_timeout_s == 60.0
+    config["reef"]["inference_stream_timeout_s"] = 12
+    config["reef"]["inference_stream_idle_timeout_s"] = 1.5
+    settings = service_config_from_mapping(config)
+    assert settings.inference_stream_timeout_s == 12
+    assert settings.inference_stream_idle_timeout_s == 1.5
+
+
+@pytest.mark.parametrize(
+    ("total_timeout_s", "idle_timeout_s"),
+    [(0, 60.0), (-1, 60.0), (300.0, 0), (300.0, -2.5)],
+)
+def test_stream_time_limits_require_positive_bounds(total_timeout_s, idle_timeout_s):
+    from reef.service.app import StreamTimeLimits
+
+    with pytest.raises(ValueError, match="positive"):
+        StreamTimeLimits(total_timeout_s=total_timeout_s, idle_timeout_s=idle_timeout_s)
+
+
 @pytest.mark.parametrize(
     ("name", "value"),
     [

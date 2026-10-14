@@ -24,7 +24,7 @@ from reef.recipe.config_fields import resolve_config_field_values
 from reef.recipe.registry import build_named_recipe, build_recipe, recipe_class_for
 from reef.runtime.deployment import RuntimeConnectionConfig, RuntimeRegistry, runtime_pair
 from reef.runtime.interfaces import InferenceRuntime, TrainingRuntime
-from reef.service.app import InferenceRetryPolicy, create_app
+from reef.service.app import InferenceRetryPolicy, StreamTimeLimits, create_app
 from reef.service.deploy.service_config import ServiceConfig, service_owned_keys
 from reef.service.deploy.training import training_deployment_for
 from reef.storage.postgres import PostgresScenarioStorage
@@ -250,6 +250,10 @@ def build_app(settings: ServiceConfig, *, environ: Mapping[str, str] | None = No
         max_s=settings.inference_retry_max_s,
         timeout_s=settings.inference_retry_timeout_s,
     )
+    stream_time_limits = StreamTimeLimits(
+        total_timeout_s=settings.inference_stream_timeout_s,
+        idle_timeout_s=settings.inference_stream_idle_timeout_s,
+    )
     dispatcher = build_dispatcher(settings, environ=environ, connector=connector)
     # No tokens (e.g. REEF_TOKEN="" in the environment) means no auth,
     # not auth with the empty string.
@@ -259,6 +263,7 @@ def build_app(settings: ServiceConfig, *, environ: Mapping[str, str] | None = No
             tokens=settings.tokens,
             console_origins=settings.console_origins,
             inference_retry_policy=retry_policy,
+            stream_time_limits=stream_time_limits,
             close_dispatcher=True,
             record_retention=record_retention,
         )
